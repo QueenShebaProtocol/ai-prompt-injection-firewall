@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------
+# Week 1 scope: database + firewall gateway (proxy + Layer 1) only.
+# The Streamlit dashboard service is added in Week 3.
+#
+# No file is mounted into /docker-entrypoint-initdb.d/ — the schema is
+# created by the gateway itself at startup via init_schema()
+# (see src/database/connection.py), since this project has no sql/ folder.
+# ---------------------------------------------------------------------
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: firewall_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:5432:5432"   # bound to localhost only — never expose this publicly
+    volumes:
+      - firewall_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: firewall_gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${PROXY_PORT:-8000}:8000"
+    volumes:
+      - ./config:/app/config:ro
+
+volumes:
+  firewall_pgdata:
