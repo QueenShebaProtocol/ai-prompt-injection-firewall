@@ -65,3 +65,25 @@ ai-prompt-firewall/
 │           ├── 1_Analytics.py     # Renders the real-time security analytics view with time-series charts, layer execution rates, and threat breakdowns.
 │           ├── 2_Threat_Logs.py   # Renders the full forensic audit page for searching, filtering, inspecting, and exporting detailed request payloads.
 │           └── 3_Configuration.py # Provides interactive UI controls to adjust sensitivity thresholds, update keyword blocklists, and hot-reload firewall rules.
+
+---
+
+## 🔀 Git Workflow
+
+All development work must be done on a separate feature branch.
+
+### Branch naming
+
+`feature/<name>-<task>`
+
+### Development workflow
+
+1. Update your local `develop` branch.
+2. Create a feature branch from `develop`.
+3. Make and test your changes.
+4. Commit your changes.
+5. Push your feature branch to GitHub.
+6. Open a Pull Request into `develop`.
+7. Wait for review and approval before merging.
+
+Do not push directly to `main` or `develop`.
