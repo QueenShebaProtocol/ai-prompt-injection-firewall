@@ -386,7 +386,7 @@ The system uses a **PostgreSQL** relational database, isolated within the organi
 ### 6.1 Table: `threat_logs`
 Stores granular inspection data for every prompt and response evaluated by the firewall.
 
-| Column | Type / Notes |
+| Colum**n** | Type / Notes |
 |---|---|
 | id | UUID, Primary Key |
 | request_id | Unique string identifier per HTTP request |
