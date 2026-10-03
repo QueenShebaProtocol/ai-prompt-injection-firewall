@@ -152,3 +152,27 @@ confirmation.
 
 No latency value in this document is presented as a measured result
 until the Wednesday model test is completed.
+
+## Wednesday Measured Results
+
+Measured with `python -m scripts.test_models` (merged in PR #25).
+
+### Layer 2 (ONNX classifier)
+
+- Input names: `input_ids`, `attention_mask`
+- Output: `logits`, shape `[batch, 2]`
+- Injection class index: **1** (confirmed)
+- Jailbreak prompts scored 0.9999 / 1.0000 on class 1; benign 0.0010 / 0.0002
+- CPU latency: mean 53.7 ms, max 78.1 ms
+
+### Layer 3 (local LLM)
+
+- `phi4-mini` via Ollama flagged an injection prompt correctly
+- Latency about 15.7 s on the first request (includes model load)
+
+### Open question
+
+The `classifier.onnx` used for testing is 736 MB, which matches
+`protectai/deberta-v3-base-prompt-injection-v2`, not PIGuard. The team
+needs to confirm which model was actually downloaded before this
+decision is final.
