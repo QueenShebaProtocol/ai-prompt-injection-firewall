@@ -54,7 +54,7 @@ class ThreatLog(Base):
             name="check_action_taken"
         ),
         CheckConstraint(
-            "triggered_layer IN ('NONE', 'LAYER 1', 'LAYER 2', 'LAYER 3', 'OUTPUT_SCANNER')",
+            "triggered_layer IN ('NONE', 'LAYER_1', 'LAYER_2', 'LAYER_3', 'OUTPUT_SCANNER')",
             name="check_triggered_layer"
         ),
     )
@@ -83,7 +83,7 @@ class FirewallRule(Base):
             name="check_rule_type"
         ),
         CheckConstraint(
-            "category IN ('JAILBREAK', 'PROMPT LEAK', 'PII', 'SYSTEM_OVERRIDE')",
+            "category IN ('JAILBREAK', 'PROMPT_LEAK', 'PII', 'SYSTEM_OVERRIDE')",
             name="check_category"
         ),
         CheckConstraint(
@@ -125,7 +125,7 @@ class AdminAuditLog(Base):
     __table_args__ = (
         Index("ix_admin_audit_logs_timestamp_desc", timestamp.desc()),
         CheckConstraint(
-            "action IN ('RULE CREATED', 'RULE UPDATED', 'RULE DELETED', 'THRESHOLD CHANGED')",
+            "action IN ('RULE_CREATED', 'RULE_UPDATED', 'RULE_DELETED', 'THRESHOLD_CHANGED')",
             name="check_audit_action"
         ),
     )
