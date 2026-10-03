@@ -30,3 +30,4 @@ Thumbs.db
 
 
 verify_schema.py
+check_fixtures.py
