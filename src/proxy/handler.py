@@ -139,14 +139,14 @@ async def chat_completions(
         "system_instruction": system_instruction,
         "is_blocked": outcome.blocked,
         "action_taken": (
-            "blocked"
+            "BLOCKED"
             if outcome.blocked
-            else "allowed"
+            else "PASSED"
         ),
         "triggered_layer": (
-            "layer_1"
+            "LAYER_1"
             if outcome.blocked
-            else None
+            else "NONE"
         ),
 
         # TODO(P5, Fri): replace temporary risk score
