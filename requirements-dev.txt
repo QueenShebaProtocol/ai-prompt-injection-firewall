@@ -2,7 +2,7 @@
 -r requirements.txt
 pytest==9.1.1
 
-#held below 2.x: tokenizers==0.23.2 requires huggingface-hub<2.0 (2.1.1 exists)
-#pip kept huggingface_hub at 1.33.0 even though 2.1.1 exists, because tokenizers requires huggingface-hub<2.0.
-
+'''held below 2.x: tokenizers==0.23.2 requires huggingface-hub<2.0 (2.1.1 exists)
+--pip kept huggingface_hub at 1.33.0 even though 2.1.1 exists, because tokenizers requires huggingface-hub<2.0.
+'''
 huggingface_hub==1.33.0
