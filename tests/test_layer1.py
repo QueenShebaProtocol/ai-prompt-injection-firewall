@@ -1,30 +1,59 @@
 """Unit tests for the Layer 1 deterministic engine (src/engine/layer_1_deterministic.py).
 
-These tests use the `engine`, `jailbreak_prompts` and `benign_prompts`
-fixtures from conftest.py and never touch a database or the network -
-`Layer1Engine.set_rules()`/`.evaluate()` are pure in-memory operations.
+Fixture entries are {"id", "category", "text"} dicts (see conftest.py /
+tests/fixtures/*.json), not plain strings. Jailbreak/benign coverage is
+parametrized directly off the fixture files (one pytest case per entry,
+named by its "id") rather than looped inside a single test function, so a
+failing prompt is reported individually instead of only the first failure
+in a loop short-circuiting the rest.
+
+These tests never touch a database or the network - Layer1Engine.set_rules()
+/.evaluate() are pure in-memory operations.
 """
+import json
 import time
+from pathlib import Path
 
 import pytest
 
 from src.engine.layer_1_deterministic import Layer1Engine
 
-
-# --- Fixture-driven coverage -------------------------------------------------
-
-
-def test_jailbreak_prompts_are_matched(engine, jailbreak_prompts):
-    for prompt in jailbreak_prompts:
-        result = engine.evaluate(prompt)
-        assert result.matched, f"expected a match for: {prompt!r}"
-        assert result.rule_id is not None
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
-def test_benign_prompts_pass(engine, benign_prompts):
-    for prompt in benign_prompts:
-        result = engine.evaluate(prompt)
-        assert not result.matched, f"expected no match for: {prompt!r} (matched {result.rule_id})"
+def _load_fixture(filename: str) -> list[dict]:
+    with open(FIXTURES_DIR / filename, encoding="utf-8") as f:
+        return json.load(f)
+
+
+# Loaded at collection time so @pytest.mark.parametrize can use them directly
+# (parametrize needs its values up front; it can't pull from a fixture
+# function, which only resolves per-test at run time).
+_JAILBREAK_ENTRIES = _load_fixture("jailbreak_prompts.json")
+_BENIGN_ENTRIES = _load_fixture("benign_prompts.json")
+
+
+# --- Fixture-driven coverage, one case per prompt -----------------------------
+
+
+@pytest.mark.parametrize(
+    "entry", _JAILBREAK_ENTRIES, ids=[e["id"] for e in _JAILBREAK_ENTRIES]
+)
+def test_jailbreak_prompts_are_matched(engine, entry):
+    result = engine.evaluate(entry["text"])
+    assert result.matched, f"[{entry['id']}/{entry['category']}] expected a match: {entry['text']!r}"
+    assert result.rule_id is not None
+
+
+@pytest.mark.parametrize(
+    "entry", _BENIGN_ENTRIES, ids=[e["id"] for e in _BENIGN_ENTRIES]
+)
+def test_benign_prompts_pass(engine, entry):
+    result = engine.evaluate(entry["text"])
+    assert not result.matched, (
+        f"[{entry['id']}/{entry['category']}] expected no match "
+        f"(matched {result.rule_id}): {entry['text']!r}"
+    )
 
 
 # --- Focused behaviour tests --------------------------------------------------
