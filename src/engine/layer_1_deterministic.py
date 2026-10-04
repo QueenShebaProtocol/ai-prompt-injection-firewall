@@ -9,6 +9,7 @@ Note: the hot-reload watcher (start_watcher / stop_watcher) is added to
 this same file on Friday by P6. It is not part of this Wednesday task.
 """
 
+import asyncio
 import logging
 import re
 import unicodedata
@@ -35,6 +36,8 @@ class Layer1Engine:
 
     def __init__(self) -> None:
         self._rules: list[dict] = []
+        self._fingerprint: tuple | None = None
+        self._watcher_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # Rule loading
@@ -87,11 +90,61 @@ class Layer1Engine:
         them. Imported lazily so this module (and set_rules/evaluate)
         can be used and tested with no database available.
         """
-        from src.database.storage import get_active_layer1_rules
+        from src.database.storage import (
+            get_active_layer1_rules,
+            get_rules_fingerprint,
+        )
 
+        # Fingerprint first: if a rule changes between the two queries,
+        # the next poll sees a newer fingerprint and reloads (never misses).
+        fingerprint = await get_rules_fingerprint()
         rules = await get_active_layer1_rules()
         self.set_rules(rules)
+        self._fingerprint = fingerprint
         logger.info("Layer 1: %d rules active", self.rule_count)
+
+    # ------------------------------------------------------------------
+    # Hot-reload watcher
+    # ------------------------------------------------------------------
+    def start_watcher(self, interval_seconds: float = 5.0) -> None:
+        """
+        Start one background task that polls the rule fingerprint and
+        reloads rules when it changes. Does nothing if already running.
+        Must be called while an event loop is running (e.g. FastAPI lifespan).
+        """
+        if self._watcher_task is not None and not self._watcher_task.done():
+            return
+        self._watcher_task = asyncio.create_task(
+            self._watch_rules(interval_seconds), name="layer1-rule-watcher"
+        )
+        logger.info("Layer 1 watcher started (every %.1fs)", interval_seconds)
+
+    async def stop_watcher(self) -> None:
+        """Cancel the watcher task and wait until it has finished."""
+        task, self._watcher_task = self._watcher_task, None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Layer 1 watcher stopped")
+
+    async def _watch_rules(self, interval_seconds: float) -> None:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                # Imported here so the engine imports without a database.
+                from src.database.storage import get_rules_fingerprint
+
+                current = await get_rules_fingerprint()
+                if current != self._fingerprint:
+                    logger.info("Layer 1: rule change detected, reloading")
+                    await self.load_rules()  # swaps rules in one assignment
+            except Exception as exc:  # cancellation is not an Exception
+                # Keep serving the last good rules; retry on next tick.
+                logger.error("Layer 1 watcher error (keeping current rules): %s", exc)
 
     # ------------------------------------------------------------------
     # Evaluation

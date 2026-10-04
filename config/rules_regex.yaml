@@ -1,0 +1,74 @@
+# rules_regex.yaml - Layer 1 deterministic rules.
+
+# Every rule has: rule_id, rule_type, category, pattern, description,
+# severity, is_active  (same columns as the firewall_rules table).
+#
+# rule_type : REGEX | KEYWORD | EXCLUSION
+# category  : JAILBREAK | PROMPT_LEAK | PII | SYSTEM_OVERRIDE
+# severity  : LOW | MEDIUM | HIGH | CRITICAL
+#
+# NOTE: a rule with `category: PII` is also valid in this same file. PII rules
+# will be added in Week 2 for the output scanner - none are added yet.
+#
+# Patterns are single-quoted so backslashes stay literal.
+# They are verb + object on purpose, so ordinary prompts are not caught.
+
+rules:
+  # --- SYSTEM_OVERRIDE ---------------------------------------------------
+  - rule_id: RULE_SYSOVERRIDE_01
+    rule_type: REGEX
+    category: SYSTEM_OVERRIDE
+    pattern: '(?i)\b(ignore|disregard|forget|override)\s+(all\s+|any\s+|the\s+)?(your\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|rules?|directives?)\b'
+    description: Direct override - "ignore (all/any/the) previous/prior/above instructions"
+    severity: CRITICAL
+    is_active: true
+
+  - rule_id: RULE_SYSOVERRIDE_02
+    rule_type: REGEX
+    category: SYSTEM_OVERRIDE
+    pattern: '(?i)\b(disregard|ignore|bypass|circumvent)\s+(all\s+|any\s+)?(of\s+)?(your|the)\s+(safety|content|ethical|moderation)\s+(guidelines?|guardrails|filters?|restrictions|policies)\b|\b(disregard|ignore|bypass|circumvent)\s+(all\s+|any\s+)?your\s+(guidelines?|guardrails|restrictions|programming|training)\b'
+    description: Guideline-disregard phrasing - "ignore your safety guidelines", "bypass your restrictions"
+    severity: HIGH
+    is_active: true
+
+  # --- JAILBREAK ---------------------------------------------------------
+  - rule_id: RULE_JAILBREAK_01
+    rule_type: REGEX
+    category: JAILBREAK
+    pattern: '(?i)\bdo\s+anything\s+now\b|\bdan\s+mode\b|\bjailbroken\s+(mode|ai|version)\b'
+    description: DAN-style persona override ("Do Anything Now", "DAN mode")
+    severity: HIGH
+    is_active: true
+
+  - rule_id: RULE_JAILBREAK_02
+    rule_type: REGEX
+    category: JAILBREAK
+    pattern: '(?i)\b(you\s+are\s+(now\s+)?in|simulate|pretend\s+(that\s+)?you\s+are\s+in|act\s+as\s+if\s+you\s+are\s+in)\s+(a\s+)?(developer|dev|god)\s+mode\b'
+    description: Developer-mode / god-mode persona override
+    severity: HIGH
+    is_active: true
+
+  - rule_id: RULE_JAILBREAK_03
+    rule_type: KEYWORD
+    category: JAILBREAK
+    pattern: jailbreak mode activated
+    description: Static keyword - common jailbreak activation phrase
+    severity: MEDIUM
+    is_active: true
+
+  # --- PROMPT_LEAK -------------------------------------------------------
+  - rule_id: RULE_PROMPT_LEAK_01
+    rule_type: REGEX
+    category: PROMPT_LEAK
+    pattern: '(?i)\b(reveal|show|print|repeat|display|output|share|leak|tell)(\s+me)?\s+(your|the)\s+(entire\s+|full\s+|exact\s+|original\s+|hidden\s+|initial\s+)*(system\s+prompt|system\s+instructions?|initial\s+prompt|hidden\s+instructions?|developer\s+(prompt|message))\b'
+    description: Prompt-extraction request - "reveal/show/print your system prompt"
+    severity: HIGH
+    is_active: true
+
+  - rule_id: RULE_PROMPT_LEAK_02
+    rule_type: REGEX
+    category: PROMPT_LEAK
+    pattern: '(?i)\bwhat\s+(is|are|were)\s+your\s+(system\s+prompt|(initial|original|hidden|secret)\s+instructions)\b'
+    description: Prompt-extraction question - "what is your system prompt"
+    severity: MEDIUM
+    is_active: true

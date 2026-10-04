@@ -1,0 +1,29 @@
+# firewall.yaml - global settings for the AI Prompt Injection Firewall.
+# Flat top level, one block per section. Week 2 adds new blocks
+# (layer_3:, output_scanner:) WITHOUT touching any key that exists here.
+
+proxy:
+  host: 0.0.0.0
+  port: 8000
+
+pipeline:
+  layer_1_enabled: true
+  layer_2_enabled: false          # Week 2
+  layer_3_enabled: false          # Week 2
+  output_scanner_enabled: false   # Week 2
+
+layer_2:
+  # Risk score is 0.0 - 1.0.
+  #   score >= high_confidence_threshold -> BLOCK
+  #   score <= low_confidence_threshold  -> ALLOW
+  #   in between                         -> escalate to Layer 3
+  high_confidence_threshold: 0.85
+  low_confidence_threshold: 0.30
+
+hot_reload:
+  rules_poll_seconds: 30          # how often the rule cache is refreshed so that edits appliy without a restart
+
+logging:
+  level: INFO
+  async_writes: true              # DB logging must never block the response(i.e the firewall answers the user first and writes the log in the background.)
+  store_output_completion: false  # keep LLM replies out of the DB by default(i.e sensitive text that could leak, must be protected, and has legal implications (GDPR, HIPAA).)
