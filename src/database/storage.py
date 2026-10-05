@@ -1,8 +1,12 @@
-"""Async write path for threat logs, plus the hourly system_metrics rollup.
+"""Async storage layer: threat-log writer, rule reader, rules fingerprint,
+and the hourly system_metrics rollup.
 
-Only the log writer and the rollup live here today - P2's Wednesday task
-adds the admin audit log functions, and P5's Friday task adds the
-dashboard getters, both to this same file.
+Functions in this file so far, by who added them:
+- write_threat_log                                    (Week 1 Wed, P4 - me)
+- get_active_layer1_rules, get_rules_fingerprint       (Week 1 Fri, P3)
+- compute_bucket..run_rollup_loop                      (Week 2 Mon, P4 - me)
+P2's Wednesday audit-log functions and P5's Friday dashboard getters land
+in this same file later this week.
 """
 
 import asyncio
@@ -13,7 +17,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.database.connection import AsyncSessionLocal
-from src.database.models import SystemMetric, ThreatLog
+from src.database.models import FirewallRule, SystemMetric, ThreatLog
 
 logger = logging.getLogger("firewall.storage")
 
@@ -34,6 +38,30 @@ async def write_threat_log(entry: dict) -> None:
         logger.error(
             "write_threat_log failed for request_id=%s", request_id, exc_info=True
         )
+
+
+# --- Hourly system_metrics rollup -------------------------------------------
+
+
+def _floor_to_hour(dt: datetime) -> datetime:
+    """Normalize a datetime to the top of its hour, in UTC."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
+async def compute_bucket(bucket_start: datetime) -> dict:
+    """Aggregate `threat_logs` over [bucket_start, bucket_start + 1h) into
+    one row matching the `system_metrics` columns. Read-only - does not
+    write anything itself."""
+    bucket_end = bucket_start + timedelta(hours=1)
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(stmt)
+        count, latest = result.one()
+    return (count, latest)
 
 
 # --- Hourly system_metrics rollup -------------------------------------------
