@@ -21,8 +21,6 @@ from src.database.models import FirewallRule, SystemMetric, ThreatLog
 
 logger = logging.getLogger("firewall.storage")
 
-LAYER1_RULE_TYPES = ("REGEX", "KEYWORD")
-
 
 async def write_threat_log(entry: dict) -> None:
     """Insert one row into `threat_logs`. Never raises.
@@ -42,40 +40,24 @@ async def write_threat_log(entry: dict) -> None:
         )
 
 
-async def get_active_layer1_rules() -> list[dict]:
-    """Return active REGEX/KEYWORD rules as dicts for Layer1Engine.set_rules().
-
-    The WHERE clause matches the (is_active, rule_type) index. Ordered by id
-    so rule order is stable (Layer 1 stops at the first match). Errors are
-    NOT swallowed: the caller decides whether to keep the old rule set.
-    """
-    stmt = (
-        select(
-            FirewallRule.rule_id,
-            FirewallRule.rule_type,
-            FirewallRule.category,
-            FirewallRule.pattern,
-            FirewallRule.severity,
-            FirewallRule.description,
-        )
-        .where(
-            FirewallRule.is_active.is_(True),
-            FirewallRule.rule_type.in_(LAYER1_RULE_TYPES),
-        )
-        .order_by(FirewallRule.id)
-    )
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(stmt)
-        return [dict(row) for row in result.mappings().all()]
+# --- Hourly system_metrics rollup -------------------------------------------
 
 
-async def get_rules_fingerprint() -> tuple:
-    """Return (row_count, max(updated_at)) in a single aggregate query.
+def _floor_to_hour(dt: datetime) -> datetime:
+    """Normalize a datetime to the top of its hour, in UTC."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(minute=0, second=0, microsecond=0)
 
-    Used by the hot-reload watcher: if the tuple changes, rules changed.
-    An empty table gives (0, None).
-    """
-    stmt = select(func.count(FirewallRule.id), func.max(FirewallRule.updated_at))
+
+async def compute_bucket(bucket_start: datetime) -> dict:
+    """Aggregate `threat_logs` over [bucket_start, bucket_start + 1h) into
+    one row matching the `system_metrics` columns. Read-only - does not
+    write anything itself."""
+    bucket_end = bucket_start + timedelta(hours=1)
+
     async with AsyncSessionLocal() as session:
         result = await session.execute(stmt)
         count, latest = result.one()
