@@ -7,8 +7,17 @@
 # category  : JAILBREAK | PROMPT_LEAK | PII | SYSTEM_OVERRIDE
 # severity  : LOW | MEDIUM | HIGH | CRITICAL
 #
-# NOTE: a rule with `category: PII` is also valid in this same file. PII rules
-# will be added in Week 2 for the output scanner - none are added yet.
+# WHO READS WHICH RULES
+#   JAILBREAK, SYSTEM_OVERRIDE, PROMPT_LEAK -> Layer 1 (layer_1_deterministic.py),
+#       matched against INBOUND prompts.
+#   PII -> output scanner (output_scanner.py), matched against LLM COMPLETIONS only.
+#       Layer 1 must not apply these to prompts.
+#
+# PII RULE ID CONVENTIONS (read by output_scanner.py)
+#   RULE_PII_CARD_*    -> also validate the match with the Luhn check (see description)
+#   RULE_PII_SECRET_*  -> reported as category SECRET_LEAK instead of PII_LEAK
+#   all other RULE_PII_* -> reported as PII_LEAK
+# All examples in this file are obviously fake. Never put real data here.
 #
 # Patterns are single-quoted so backslashes stay literal.
 # They are verb + object on purpose, so ordinary prompts are not caught.
@@ -71,4 +80,106 @@ rules:
     pattern: '(?i)\bwhat\s+(is|are|were)\s+your\s+(system\s+prompt|(initial|original|hidden|secret)\s+instructions)\b'
     description: Prompt-extraction question - "what is your system prompt"
     severity: MEDIUM
+    is_active: true
+
+  # =======================================================================
+  # PII / SECRETS - consumed by the OUTPUT SCANNER, not by Layer 1
+  # =======================================================================
+
+  # --- PII ---------------------------------------------------------------
+  - rule_id: RULE_PII_EMAIL_01
+    rule_type: REGEX
+    category: PII
+    pattern: '(?i)\b[a-z0-9._%+\-]+@[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.[a-z]{2,}\b'
+    description: Email address (example alice.example@example.com)
+    severity: MEDIUM
+    is_active: true
+
+  - rule_id: RULE_PII_PHONE_01
+    rule_type: REGEX
+    category: PII
+    pattern: '(?<![\w+])\+\d{1,3}[ .\-]?\(?\d{1,4}\)?(?:[ .\-]?\d{2,4}){2,3}\b'
+    description: International phone number with + prefix (example +251 911 234 567)
+    severity: MEDIUM
+    is_active: true
+
+  - rule_id: RULE_PII_PHONE_02
+    rule_type: REGEX
+    category: PII
+    pattern: '(?<!\d)(?:\+?1[ .\-]?)?\(?\d{3}\)?[ .\-]\d{3}[ .\-]\d{4}(?!\d)'
+    description: North American phone number (example (555) 010-1234)
+    severity: MEDIUM
+    is_active: true
+
+  - rule_id: RULE_PII_PHONE_03
+    rule_type: REGEX
+    category: PII
+    pattern: '(?<!\d)0[79]\d{8}(?!\d)'
+    description: Ethiopian local mobile number (example 0911234567). May match other 10-digit IDs starting 07/09
+    severity: LOW
+    is_active: true
+
+  - rule_id: RULE_PII_CARD_01
+    rule_type: REGEX
+    category: PII
+    pattern: '(?<!\d)(?:\d[ \-]?){12,18}\d(?!\d)'
+    description: Payment card number, 13-19 digits with optional spaces or dashes (validate - luhn). Scanner must run the Luhn check on every match (example 4111 1111 1111 1111 is a public test number)
+    severity: HIGH
+    is_active: true
+
+  # --- SECRETS / API KEYS (rule_id prefix RULE_PII_SECRET_ -> SECRET_LEAK) -
+  - rule_id: RULE_PII_SECRET_AWS_01
+    rule_type: REGEX
+    category: PII
+    pattern: '\b(?:AKIA|ASIA)[0-9A-Z]{16}\b'
+    description: AWS access key ID - AKIA or ASIA then 16 uppercase letters or digits (fake example AKIAFAKEFAKEFAKEFAKE)
+    severity: CRITICAL
+    is_active: true
+
+  - rule_id: RULE_PII_SECRET_GITHUB_01
+    rule_type: REGEX
+    category: PII
+    pattern: '\bgh[pousr]_[A-Za-z0-9]{36,}\b'
+    description: GitHub token - ghp_, gho_, ghu_, ghs_ or ghr_ prefix then 36+ characters
+    severity: CRITICAL
+    is_active: true
+
+  - rule_id: RULE_PII_SECRET_OPENAI_01
+    rule_type: REGEX
+    category: PII
+    pattern: '\bsk-[A-Za-z0-9_\-]{20,}\b'
+    description: API secret key with sk- prefix followed by 20+ characters
+    severity: CRITICAL
+    is_active: true
+
+  - rule_id: RULE_PII_SECRET_SLACK_01
+    rule_type: REGEX
+    category: PII
+    pattern: '\bxox[baprs]-[A-Za-z0-9\-]{10,}\b'
+    description: Slack token - xoxb-, xoxa-, xoxp-, xoxr- or xoxs- prefix
+    severity: CRITICAL
+    is_active: true
+
+  - rule_id: RULE_PII_SECRET_GOOGLE_01
+    rule_type: REGEX
+    category: PII
+    pattern: '\bAIza[0-9A-Za-z_\-]{35}\b'
+    description: Google API key - AIza prefix followed by 35 characters
+    severity: HIGH
+    is_active: true
+
+  - rule_id: RULE_PII_SECRET_PRIVKEY_01
+    rule_type: REGEX
+    category: PII
+    pattern: '-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----'
+    description: PEM private key header
+    severity: CRITICAL
+    is_active: true
+
+  - rule_id: RULE_PII_SECRET_JWT_01
+    rule_type: REGEX
+    category: PII
+    pattern: '\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b'
+    description: JSON Web Token - three base64url parts separated by dots, starting with eyJ
+    severity: HIGH
     is_active: true
