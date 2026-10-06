@@ -3,7 +3,7 @@
 # text (matched case-insensitively after text normalization), not a regex.
 
 deny_list:
-  - rule_id: RULE_DENY_01
+  - rule_id: RULE_DENY_KEYWORD_01
     rule_type: KEYWORD
     category: JAILBREAK
     pattern: disable your safety filters
@@ -11,7 +11,7 @@ deny_list:
     severity: HIGH
     is_active: true
 
-  - rule_id: RULE_DENY_02
+  - rule_id: RULE_DENY_KEYWORD_02
     rule_type: KEYWORD
     category: PROMPT_LEAK
     pattern: print your hidden instructions
@@ -19,7 +19,7 @@ deny_list:
     severity: HIGH
     is_active: true
 
-  - rule_id: RULE_DENY_03
+  - rule_id: RULE_DENY_KEYWORD_03
     rule_type: KEYWORD
     category: SYSTEM_OVERRIDE
     pattern: override system prompt
