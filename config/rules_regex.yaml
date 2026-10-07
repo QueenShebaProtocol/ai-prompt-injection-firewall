@@ -24,15 +24,15 @@
 
 rules:
   # --- SYSTEM_OVERRIDE ---------------------------------------------------
-  - rule_id: RULE_SYSOVERRIDE_01
+  - rule_id: RULE_SYSTEM_OVERRIDE_01
     rule_type: REGEX
     category: SYSTEM_OVERRIDE
-    pattern: '(?i)\b(ignore|disregard|forget|override)\s+(all\s+|any\s+|the\s+)?(your\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|rules?|directives?)\b'
+    pattern: '(?i)\b(ignore|disregard|forget|override)\s+(?:(?:all|any)\s+)?(?:the\s+)?(?:your\s+)?(?:previous|prior|above|earlier)\s+(instructions?|prompts?|rules?|directives?)\b'
     description: Direct override - "ignore (all/any/the) previous/prior/above instructions"
     severity: CRITICAL
     is_active: true
-
-  - rule_id: RULE_SYSOVERRIDE_02
+ 
+  - rule_id: RULE_SYSTEM_OVERRIDE_02
     rule_type: REGEX
     category: SYSTEM_OVERRIDE
     pattern: '(?i)\b(disregard|ignore|bypass|circumvent)\s+(all\s+|any\s+)?(of\s+)?(your|the)\s+(safety|content|ethical|moderation)\s+(guidelines?|guardrails|filters?|restrictions|policies)\b|\b(disregard|ignore|bypass|circumvent)\s+(all\s+|any\s+)?your\s+(guidelines?|guardrails|restrictions|programming|training)\b'
@@ -69,7 +69,7 @@ rules:
   - rule_id: RULE_PROMPT_LEAK_01
     rule_type: REGEX
     category: PROMPT_LEAK
-    pattern: '(?i)\b(reveal|show|print|repeat|display|output|share|leak|tell)(\s+me)?\s+(your|the)\s+(entire\s+|full\s+|exact\s+|original\s+|hidden\s+|initial\s+)*(system\s+prompt|system\s+instructions?|initial\s+prompt|hidden\s+instructions?|developer\s+(prompt|message))\b'
+    pattern: '(?i)\b(reveal|show|print|repeat|display|output|share|leak|tell)(\s+me)?\s+(your|the)\s+(?:(?:entire|full|exact|original|hidden|initial)\s+){0,3}(system\s+prompt|system\s+instructions?|initial\s+prompt|hidden\s+instructions?|developer\s+(prompt|message))\b'
     description: Prompt-extraction request - "reveal/show/print your system prompt"
     severity: HIGH
     is_active: true

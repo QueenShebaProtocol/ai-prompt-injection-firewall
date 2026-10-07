@@ -18,10 +18,10 @@ layer_2:
   #   score <= low_confidence_threshold  -> ALLOW
   #   in between                         -> escalate to Layer 3
   high_confidence_threshold: 0.85
-  low_confidence_threshold: 0.30
+  low_confidence_threshold: 0.35
 
 hot_reload:
-  rules_poll_seconds: 30          # how often the rule cache is refreshed so that edits appliy without a restart
+  rules_poll_seconds: 5          # how often the rule cache is refreshed so that edits appliy without a restart
 
 logging:
   level: INFO
