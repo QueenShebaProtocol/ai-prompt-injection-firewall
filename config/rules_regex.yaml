@@ -27,7 +27,7 @@ rules:
   - rule_id: RULE_SYSTEM_OVERRIDE_01
     rule_type: REGEX
     category: SYSTEM_OVERRIDE
-    pattern: '(?i)\b(ignore|disregard|forget|override)\s+(?:(?:all|any)\s+)?(?:the\s+)?(?:your\s+)?(?:previous|prior|above|earlier)\s+(instructions?|prompts?|rules?|directives?)\b'
+    pattern: '(?i)\b(ignore|disregard|forget|override)\s+(?:(?:all|any)\s+)?(?:the\s+)?(?:your\s+)?(?:previous|prior|above|earlier)\s+(instructions?|prompts?|rules?|directives?)\b(?!\s+(?:in|of|about|regarding|concerning)\s+(?!this\s+(?:conversation|chat|session)\b))'
     description: Direct override - "ignore (all/any/the) previous/prior/above instructions"
     severity: CRITICAL
     is_active: true
@@ -40,11 +40,27 @@ rules:
     severity: HIGH
     is_active: true
 
+  - rule_id: RULE_SYSTEM_OVERRIDE_03
+    rule_type: REGEX
+    category: SYSTEM_OVERRIDE
+    pattern: '(?i)\b(?:disable|deactivate|turn\s+off|switch\s+off)\s+(?:all\s+|any\s+)?(?:of\s+)?your\s+(?:safety|content|ethical|moderation)\s+(?:filters?|guidelines?|guardrails|restrictions|policies|checks?)\b'
+    description: Safety-disable request - "disable / turn off your safety filters"
+    severity: HIGH
+    is_active: true
+
+  - rule_id: RULE_SYSTEM_OVERRIDE_04
+    rule_type: REGEX
+    category: SYSTEM_OVERRIDE
+    pattern: '(?i)\boverride\s+(?:the\s+|your\s+)?system\s+(?:prompt|instructions?)\s*:'
+    description: 'Injection header - "Override system prompt: ..." (colon required so developer questions about overriding a prompt are not caught)'
+    severity: HIGH
+    is_active: true
+
   # --- JAILBREAK ---------------------------------------------------------
   - rule_id: RULE_JAILBREAK_01
     rule_type: REGEX
     category: JAILBREAK
-    pattern: '(?i)\bdo\s+anything\s+now\b|\bdan\s+mode\b|\bjailbroken\s+(mode|ai|version)\b'
+    pattern: '(?i)\bdo\s+anything\s+now\b|(?<!\bon\s)(?<!\babout\s)(?<!\bof\s)(?<!\bregarding\s)(?<!\bcalled\s)\bdan\s+mode\b|\bjailbroken\s+(mode|ai|version)\b'
     description: DAN-style persona override ("Do Anything Now", "DAN mode")
     severity: HIGH
     is_active: true
@@ -52,7 +68,7 @@ rules:
   - rule_id: RULE_JAILBREAK_02
     rule_type: REGEX
     category: JAILBREAK
-    pattern: '(?i)\b(you\s+are\s+(now\s+)?in|simulate|pretend\s+(that\s+)?you\s+are\s+in|act\s+as\s+if\s+you\s+are\s+in)\s+(a\s+)?(developer|dev|god)\s+mode\b'
+    pattern: '(?i)(?:\byou\s+are\s+(?:now\s+)?in|(?:^|[.!?;:,]\s*|\b(?:please|now|and|then)\s+)simulate|\bpretend\s+(?:that\s+)?you\s+are\s+in|\bact\s+as\s+if\s+you\s+are\s+in)\s+(?:a\s+)?(?:developer|dev|god)\s+mode\b'
     description: Developer-mode / god-mode persona override
     severity: HIGH
     is_active: true
@@ -69,7 +85,7 @@ rules:
   - rule_id: RULE_PROMPT_LEAK_01
     rule_type: REGEX
     category: PROMPT_LEAK
-    pattern: '(?i)\b(reveal|show|print|repeat|display|output|share|leak|tell)(\s+me)?\s+(your|the)\s+(?:(?:entire|full|exact|original|hidden|initial)\s+){0,3}(system\s+prompt|system\s+instructions?|initial\s+prompt|hidden\s+instructions?|developer\s+(prompt|message))\b'
+    pattern: '(?i)\b(?:(?:reveal|show|print|repeat|display|output|share|leak|tell)(?:\s+me)?\s+(?:your\s+(?:(?:entire|full|exact|original|hidden|initial)\s+){0,3}|the\s+(?:(?:entire|full|exact|original|hidden|initial)\s+){1,3})|(?:reveal|leak)(?:\s+me)?\s+the\s+)(system\s+prompt|system\s+instructions?|initial\s+prompt|hidden\s+instructions?|developer\s+(?:prompt|message))\b'
     description: Prompt-extraction request - "reveal/show/print your system prompt"
     severity: HIGH
     is_active: true
