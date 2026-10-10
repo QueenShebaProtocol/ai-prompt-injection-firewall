@@ -14,14 +14,25 @@ Functions in this file:
     Week 2 Monday, P4
 - write_audit_log
     Week 2 Wednesday, P2
+- run_sync, ttl_cache, LogFilters, Page
+- get_kpi_summary, get_timeseries, get_layer_distribution
+- search_threat_logs, get_log_detail
+- get_active_output_scanner_rules
+    Week 2 Friday, P5
 """
 
 import asyncio
+import copy
+import functools
 import logging
+import threading
+import time
+from concurrent.futures import TimeoutError as FutureTimeout
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, literal_column, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.database.connection import AsyncSessionLocal
@@ -541,3 +552,390 @@ async def write_audit_log(
         normalized_action,
         normalized_rule_id,
     )
+
+
+
+# --- Dashboard data layer (Week 2 Fri, P5) ----------------------------
+#
+# The Streamlit dashboard is synchronous, but the database code is async.
+# run_sync() lets the dashboard call async getters safely, and ttl_cache()
+# stops the dashboard from hitting the database on every page refresh.
+
+MAX_PAGE_SIZE = 200
+DEFAULT_PAGE_SIZE = 50
+RECENT_HOURS_LIMIT = 48          # <= 48h: read threat_logs, > 48h: read system_metrics
+PROMPT_PREVIEW_CHARS = 200
+
+_VALID_LAYERS = {"NONE", "LAYER_1", "LAYER_2", "LAYER_3", "OUTPUT_SCANNER"}
+_VALID_RULE_CATEGORIES = {"JAILBREAK", "PROMPT_LEAK", "PII", "SYSTEM_OVERRIDE"}
+
+# Fixed constants, never built from user input. They are literal_column objects
+# (not bind parameters) so that date_trunc('hour', col) is written identically in
+# SELECT and GROUP BY, which PostgreSQL requires.
+_BUCKET_SQL = {
+    "minute": literal_column("'minute'"),
+    "hour": literal_column("'hour'"),
+    "day": literal_column("'day'"),
+}
+
+
+# --- 1. run_sync: one long-lived background event loop ----------------
+_loop: asyncio.AbstractEventLoop | None = None
+_loop_lock = threading.Lock()
+
+
+def _get_background_loop() -> asyncio.AbstractEventLoop:
+    """Start (once) a dedicated thread that runs one event loop forever.
+
+    asyncpg connections belong to the loop they were created on, so every
+    dashboard query must run on this same loop.
+    """
+    global _loop
+    with _loop_lock:
+        if _loop is not None and _loop.is_running():
+            return _loop
+
+        loop = asyncio.new_event_loop()
+        started = threading.Event()
+
+        def _run() -> None:
+            asyncio.set_event_loop(loop)
+            loop.call_soon(started.set)
+            loop.run_forever()
+
+        threading.Thread(target=_run, name="storage-event-loop", daemon=True).start()
+        started.wait()
+        _loop = loop
+        return _loop
+
+
+def run_sync(coro, timeout: float = 30.0) -> Any:
+    """Run an async coroutine from synchronous code (Streamlit) and return its result.
+
+    Usage:  kpis = run_sync(get_kpi_summary(24))
+    Do not call this from inside async code; use `await` there.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass  # no loop running in this thread: the normal Streamlit case
+    else:
+        coro.close()
+        raise RuntimeError(
+            "run_sync() cannot be called from a running event loop; use await instead."
+        )
+
+    loop = _get_background_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeout:
+        future.cancel()
+        raise TimeoutError(f"Database call did not finish within {timeout} seconds")
+
+
+# --- 2. ttl_cache: remember results for a few seconds -----------------
+def ttl_cache(seconds: float, maxsize: int = 128):
+    """Cache an async function's result for `seconds`, keyed by its arguments.
+
+    - A second identical call inside the TTL returns the stored result and
+      runs no query.
+    - Errors are never cached.
+    - Callers get a deep copy, so changing the result cannot corrupt the cache.
+    - Call fn.cache_clear() in tests.
+    """
+
+    def decorator(fn):
+        store: dict = {}
+        lock = threading.Lock()
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            try:
+                key = (args, tuple(sorted(kwargs.items())))
+                hash(key)
+            except TypeError:
+                return await fn(*args, **kwargs)  # unhashable arguments: skip caching
+
+            now = time.monotonic()
+            with lock:
+                entry = store.get(key)
+                if entry is not None and entry[0] > now:
+                    return copy.deepcopy(entry[1])
+
+            result = await fn(*args, **kwargs)
+
+            with lock:
+                if len(store) >= maxsize:
+                    for expired in [k for k, (exp, _) in store.items() if exp <= now]:
+                        del store[expired]
+                    if len(store) >= maxsize:
+                        store.pop(next(iter(store)))  # drop the oldest entry
+                store[key] = (time.monotonic() + seconds, result)
+            return copy.deepcopy(result)
+
+        def cache_clear() -> None:
+            with lock:
+                store.clear()
+
+        wrapper.cache_clear = cache_clear
+        return wrapper
+
+    return decorator
+
+
+# --- 3. Filters and pages ---------------------------------------------
+@dataclass(frozen=True)
+class LogFilters:
+    """Search filters for threat_logs. Every field is optional (None = no filter)."""
+
+    start: datetime | None = None          # created_at >= start
+    end: datetime | None = None            # created_at <  end
+    is_blocked: bool | None = None
+    triggered_layer: str | None = None     # NONE | LAYER_1 | LAYER_2 | LAYER_3 | OUTPUT_SCANNER
+    client_ip: str | None = None
+    min_risk: float | None = None          # risk_score >= min_risk
+    text: str | None = None                # case-insensitive "contains" on raw_prompt
+
+
+@dataclass
+class Page:
+    items: list[dict]
+    total: int
+    page: int
+    page_size: int
+
+
+def _window(hours: int, offset_hours: int = 0) -> tuple[datetime, datetime]:
+    """Return (start, end) for 'the last `hours` hours', optionally shifted back."""
+    hours = max(1, int(hours))
+    offset_hours = max(0, int(offset_hours))
+    end = datetime.now(timezone.utc) - timedelta(hours=offset_hours)
+    return end - timedelta(hours=hours), end
+
+
+def _escape_like(text: str) -> str:
+    """Make % and _ in the user's search text match literally."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _apply_filters(stmt, f: LogFilters | None):
+    """Add WHERE clauses for each filter that is set. Every value is a bound parameter."""
+    if f is None:
+        return stmt
+    if f.start is not None:
+        stmt = stmt.where(ThreatLog.created_at >= f.start)
+    if f.end is not None:
+        stmt = stmt.where(ThreatLog.created_at < f.end)
+    if f.is_blocked is not None:
+        stmt = stmt.where(ThreatLog.is_blocked.is_(bool(f.is_blocked)))
+    if f.triggered_layer:
+        if f.triggered_layer not in _VALID_LAYERS:
+            raise ValueError(f"Unknown triggered_layer: {f.triggered_layer!r}")
+        stmt = stmt.where(ThreatLog.triggered_layer == f.triggered_layer)
+    if f.client_ip:
+        stmt = stmt.where(ThreatLog.client_ip == f.client_ip)
+    if f.min_risk is not None:
+        stmt = stmt.where(ThreatLog.risk_score >= float(f.min_risk))
+    if f.text:
+        stmt = stmt.where(
+            ThreatLog.raw_prompt.ilike(f"%{_escape_like(f.text)}%", escape="\\")
+        )
+    return stmt
+
+
+# --- 4. Getters --------------------------------------------------------
+@ttl_cache(15)
+async def get_kpi_summary(hours: int = 24, offset_hours: int = 0) -> dict:
+    """Headline numbers for the last `hours` hours.
+
+    offset_hours=hours gives the PREVIOUS period (for the delta on the KPI cards).
+    """
+    start, end = _window(hours, offset_hours)
+    stmt = select(
+        func.count().label("total"),
+        func.count().filter(ThreatLog.is_blocked.is_(True)).label("blocked"),
+        func.coalesce(func.avg(ThreatLog.execution_time_ms), 0.0).label("avg_latency"),
+        func.coalesce(
+            func.percentile_cont(0.95).within_group(ThreatLog.execution_time_ms), 0.0
+        ).label("p95_latency"),
+    ).where(ThreatLog.created_at >= start, ThreatLog.created_at < end)
+
+    async with AsyncSessionLocal() as session:
+        row = (await session.execute(stmt)).one()
+
+    total = int(row.total)
+    blocked = int(row.blocked)
+    return {
+        "total_requests": total,
+        "blocked_requests": blocked,
+        "block_rate": (blocked / total) if total else 0.0,   # 0.0 - 1.0
+        "avg_latency_ms": float(row.avg_latency or 0.0),
+        "p95_latency_ms": float(row.p95_latency or 0.0),
+        "hours": max(1, int(hours)),
+    }
+
+
+@ttl_cache(30)
+async def get_timeseries(hours: int = 24, bucket: str = "hour") -> list[dict]:
+    """Requests and blocks per time bucket, oldest first.
+
+    <= 48 hours: counted live from threat_logs.
+    >  48 hours: summed from the pre-aggregated system_metrics table
+                 (hourly rows, so 'minute' falls back to 'hour').
+    """
+    if bucket not in _BUCKET_SQL:
+        raise ValueError(f"bucket must be one of {sorted(_BUCKET_SQL)}, got {bucket!r}")
+
+    hours = max(1, int(hours))
+    start = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    if hours <= RECENT_HOURS_LIMIT:
+        bucket_expr = func.date_trunc(_BUCKET_SQL[bucket], ThreatLog.created_at)
+        stmt = (
+            select(
+                bucket_expr.label("bucket_start"),
+                func.count().label("total_requests"),
+                func.count().filter(ThreatLog.is_blocked.is_(True)).label("blocked_requests"),
+            )
+            .where(ThreatLog.created_at >= start)
+            .group_by(bucket_expr)
+            .order_by(bucket_expr)
+        )
+    else:
+        unit = _BUCKET_SQL["day" if bucket == "day" else "hour"]
+        bucket_expr = func.date_trunc(unit, SystemMetric.bucket_start)
+        stmt = (
+            select(
+                bucket_expr.label("bucket_start"),
+                func.coalesce(func.sum(SystemMetric.total_requests), 0).label("total_requests"),
+                func.coalesce(func.sum(SystemMetric.blocked_requests), 0).label("blocked_requests"),
+            )
+            .where(SystemMetric.bucket_start >= start)
+            .group_by(bucket_expr)
+            .order_by(bucket_expr)
+        )
+
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(stmt)).all()
+
+    return [
+        {
+            "bucket_start": r.bucket_start,
+            "total_requests": int(r.total_requests),
+            "blocked_requests": int(r.blocked_requests),
+        }
+        for r in rows
+    ]
+
+
+@ttl_cache(30)
+async def get_layer_distribution(hours: int = 24) -> dict:
+    """How many BLOCKED requests each layer stopped, e.g. {"LAYER_1": 12, ...}."""
+    start, end = _window(hours)
+    stmt = (
+        select(ThreatLog.triggered_layer, func.count())
+        .where(ThreatLog.created_at >= start, ThreatLog.is_blocked.is_(True))
+        .group_by(ThreatLog.triggered_layer)
+    )
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(stmt)).all()
+
+    distribution = {"LAYER_1": 0, "LAYER_2": 0, "LAYER_3": 0, "OUTPUT_SCANNER": 0}
+    for layer, count in rows:
+        # A fail-closed pipeline error is logged as blocked with layer "NONE";
+        # it shows up here under its own key instead of being hidden.
+        distribution[layer] = int(count)
+    return distribution
+
+
+@ttl_cache(10)
+async def search_threat_logs(
+    filters: LogFilters | None = None,
+    page: int = 1,
+    page_size: int = DEFAULT_PAGE_SIZE,
+) -> Page:
+    """One page of log rows (newest first) plus the total number of matches."""
+    page = max(1, int(page))
+    page_size = min(max(1, int(page_size)), MAX_PAGE_SIZE)
+
+    count_stmt = _apply_filters(select(func.count()).select_from(ThreatLog), filters)
+    rows_stmt = _apply_filters(
+        select(
+            ThreatLog.created_at,
+            ThreatLog.request_id,
+            ThreatLog.client_ip,
+            ThreatLog.application_id,
+            ThreatLog.target_model,
+            ThreatLog.is_blocked,
+            ThreatLog.action_taken,
+            ThreatLog.triggered_layer,
+            ThreatLog.risk_score,
+            ThreatLog.output_flagged,
+            # only the first characters, so huge prompts are not loaded for the table
+            func.left(ThreatLog.raw_prompt, PROMPT_PREVIEW_CHARS).label("prompt_preview"),
+        ),
+        filters,
+    )
+    rows_stmt = (
+        rows_stmt.order_by(ThreatLog.created_at.desc(), ThreatLog.id.desc())
+        .limit(page_size)
+        .offset((page - 1) * page_size)
+    )
+
+    async with AsyncSessionLocal() as session:
+        total = (await session.execute(count_stmt)).scalar_one()
+        rows = (await session.execute(rows_stmt)).mappings().all()
+
+    return Page(
+        items=[dict(r) for r in rows],
+        total=int(total),
+        page=page,
+        page_size=page_size,
+    )
+
+
+@ttl_cache(10)
+async def get_log_detail(request_id: str) -> dict | None:
+    """Every column of one threat_logs row, or None if the request_id is unknown."""
+    stmt = select(ThreatLog).where(ThreatLog.request_id == request_id)
+    async with AsyncSessionLocal() as session:
+        obj = (await session.execute(stmt)).scalar_one_or_none()
+
+    if obj is None:
+        return None
+    detail = {c.name: getattr(obj, c.name) for c in ThreatLog.__table__.columns}
+    detail["id"] = str(detail["id"])
+    return detail
+
+
+# --- 5. Rule reader for the output scanner (used by P2's detect_pii) ---
+async def get_active_output_scanner_rules(category: str = "PII") -> list[dict]:
+    """Active rules of one category, as rule dictionaries (not cached on purpose,
+    so detect_pii sees rule changes; it caches its own compiled patterns)."""
+    if category not in _VALID_RULE_CATEGORIES:
+        raise ValueError(f"Unknown rule category: {category!r}")
+
+    stmt = (
+        select(FirewallRule)
+        .where(
+            FirewallRule.is_active.is_(True),
+            FirewallRule.category == category,
+            FirewallRule.rule_type.in_(("REGEX", "KEYWORD")),
+        )
+        .order_by(FirewallRule.rule_id)
+    )
+    async with AsyncSessionLocal() as session:
+        rules = (await session.execute(stmt)).scalars().all()
+
+    return [
+        {
+            "rule_id": r.rule_id,
+            "rule_type": r.rule_type,
+            "category": r.category,
+            "pattern": r.pattern,
+            "description": r.description,
+            "severity": r.severity,
+        }
+        for r in rules
+    ]
