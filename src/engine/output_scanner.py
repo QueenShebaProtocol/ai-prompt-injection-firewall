@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Mapping, Sequence
@@ -131,19 +132,128 @@ def redact_completion_payload(
 # P1 Wednesday: preserve the real implementation from your existing branch.
 # ---------------------------------------------------------------------------
 
+_WORD_RE = re.compile(r"\w+")
+
+SYSTEM_PROMPT_LEAK = "SYSTEM_PROMPT_LEAK"
+
+# Scan limits (keeps the detector fast and its cost predictable).
+# Only the first MAX_COMPLETION_CHARS characters of a completion are scanned,
+# so a leak that starts after that point is not detected.
+# Only the first MAX_SYSTEM_CHARS characters of the system instruction are used.
+MAX_COMPLETION_CHARS = 20_000
+MAX_SYSTEM_CHARS = 50_000
+
+
+def normalize_with_offsets(text: str) -> tuple[str, list[int], list[int]]:
+    """Normalize `text` and return (normalized, starts, ends).
+
+    Normalization: NFKC, lowercase, invisible format characters (zero-width
+    spaces, soft hyphens, ...) removed, runs of whitespace collapsed to one
+    space, leading/trailing whitespace removed.
+
+    `starts[j]` / `ends[j]` give the [start, end) range in the ORIGINAL text
+    that produced normalized character j, so matches can be mapped back.
+    """
+    out: list[str] = []
+    starts: list[int] = []
+    ends: list[int] = []
+    prev_space = True  # also strips leading whitespace
+    n = len(text)
+    i = 0
+    while i < n:
+        # Keep a base character together with its combining marks, so NFKC
+        # composes them the same way it would for the whole string.
+        j = i + 1
+        while j < n and unicodedata.combining(text[j]):
+            j += 1
+        for ch in unicodedata.normalize("NFKC", text[i:j]).lower():
+            if ch.isspace():
+                if not prev_space:
+                    out.append(" ")
+                    starts.append(i)
+                    ends.append(j)
+                    prev_space = True
+            elif unicodedata.category(ch) == "Cf":
+                continue  # invisible format character
+            else:
+                out.append(ch)
+                starts.append(i)
+                ends.append(j)
+                prev_space = False
+        i = j
+
+    if out and out[-1] == " ":  # strip trailing whitespace
+        out.pop()
+        starts.pop()
+        ends.pop()
+    return "".join(out), starts, ends
+
+
+def normalize(text: str) -> str:
+    """NFKC, lowercase, collapse whitespace. See `normalize_with_offsets`."""
+    if text.isascii():  # fast path: same result, no offset map needed
+        return " ".join(text.lower().split())
+    return normalize_with_offsets(text)[0]
+
+
+def _tokenize(text: str) -> list[tuple[str, int, int]]:
+    """Split `text` into normalized words, as (word, start, end) where
+    start/end are offsets in the ORIGINAL text."""
+    if text.isascii():
+        # Lowercasing ASCII keeps every offset identical to the original.
+        return [(m.group(), m.start(), m.end()) for m in _WORD_RE.finditer(text.lower())]
+
+    normalized, starts, ends = normalize_with_offsets(text)
+    return [
+        (m.group(), starts[m.start()], ends[m.end() - 1])
+        for m in _WORD_RE.finditer(normalized)
+    ]
+
+
 def detect_system_prompt_leak(
     completion: str,
     system_instruction: str,
     min_words: int = 8,
 ) -> list[Span]:
-    """Detect system-instruction overlap.
+    """Find places where `completion` repeats the system instruction.
 
-    IMPORTANT: If P1 has already implemented this function, preserve and use
-    that implementation. This placeholder mirrors the stub in the code
-    supplied with the task and is not the P2 Friday deliverable.
+    A leak is `min_words` or more consecutive words that appear in the same
+    order in the system instruction. Comparison ignores case, punctuation,
+    spacing and Unicode width/compatibility differences. Overlapping or
+    adjacent matches are merged into one span (category SYSTEM_PROMPT_LEAK)
+    with offsets in the original `completion`.
+
+    Cost: one pass over each text plus one hash lookup per completion word.
+    Returns [] when either input is empty or the system instruction has fewer
+    than `min_words` words.
     """
-    # TODO(P1, Wed): preserve P1's completed implementation here.
-    return []
+    if not completion or not system_instruction:
+        return []
+    k = max(1, int(min_words))
+
+    sys_words = [w for w, _, _ in _tokenize(system_instruction[:MAX_SYSTEM_CHARS])]
+    if len(sys_words) < k:
+        return []
+    shingles = {tuple(sys_words[i : i + k]) for i in range(len(sys_words) - k + 1)}
+
+    tokens = _tokenize(completion[:MAX_COMPLETION_CHARS])
+    words = [w for w, _, _ in tokens]
+
+    spans: list[Span] = []
+    run_start = -1  # first word index of the current leaked run
+    run_end = -1    # last word index of the current leaked run
+    for i in range(len(words) - k + 1):
+        if tuple(words[i : i + k]) not in shingles:
+            continue
+        if run_start >= 0 and i <= run_end + 1:  # overlaps or touches the run
+            run_end = i + k - 1
+        else:
+            if run_start >= 0:
+                spans.append(Span(start=tokens[run_start][1], end=tokens[run_end][2], category=SYSTEM_PROMPT_LEAK))
+            run_start, run_end = i, i + k - 1
+    if run_start >= 0:
+        spans.append(Span(start=tokens[run_start][1], end=tokens[run_end][2], category=SYSTEM_PROMPT_LEAK))
+    return spans
 
 
 # ---------------------------------------------------------------------------
