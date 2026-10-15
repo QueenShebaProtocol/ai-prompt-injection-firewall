@@ -23,7 +23,6 @@ import copy
 import hmac
 import os
 import re
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -31,15 +30,7 @@ from typing import Any, Callable, Iterable
 
 import streamlit as st
 
-_DASHBOARD_DIR = Path(__file__).resolve().parents[1]
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(_DASHBOARD_DIR) not in sys.path:
-    sys.path.insert(0, str(_DASHBOARD_DIR))
-
-try:  # the shared dashboard shell (app.py); the page still works without it
-    import app as _shell
-except Exception:
-    _shell = None
 
 # ------------------------------------------------------------------ constants
 ADMIN_PASSWORD_ENV = "DASHBOARD_ADMIN_PASSWORD"
@@ -96,18 +87,32 @@ def _seed_rules() -> list[dict[str, Any]]:
     ]
 
 
-# --------------------------------------------------------- shell (app.py) glue
+# ---------------------------------------------------------------- page chrome
+# This page does NOT import app.py: app.py draws the whole landing page as soon
+# as it is imported, so importing it here would draw that page inside this one
+# and call set_page_config twice.
+# TODO: use the shared render_sidebar() once app.py is safe to import.
+_BRAND_HTML = (  # fixed text only: nothing a user typed is ever put in here
+    '<div style="margin:2px 0 10px 0">'
+    '<div style="color:#E8B75B;font-family:Georgia,serif;font-size:26px;'
+    'font-weight:bold;letter-spacing:2px">♕ SHEBA<br>SHIELD</div>'
+    '<div style="color:#91A7C7;font-size:10px;letter-spacing:2px">'
+    "AI PROTECTION · SOVEREIGNTY · TRUST</div></div>"
+)
+
+
 def _configure_page(title: str) -> None:
-    fn = getattr(_shell, "configure_page", None)
-    if fn:
-        fn(title)
-    else:
-        st.set_page_config(page_title=title, layout="wide")
+    st.set_page_config(
+        page_title=f"{title} | Sheba Shield",
+        page_icon="🛡️",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
 
 
-def _render_sidebar() -> dict:
-    fn = getattr(_shell, "render_sidebar", None)
-    return fn() if fn else {}
+def _render_sidebar() -> None:
+    with st.sidebar:
+        st.markdown(_BRAND_HTML, unsafe_allow_html=True)
 
 
 # -------------------------------------------------------------- admin sign-in
