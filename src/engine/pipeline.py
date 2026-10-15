@@ -1,11 +1,24 @@
 """
 Inspection pipeline orchestrator - Week 2 scope.
 
-Cascade: Layer 1 (deterministic) -> Layer 2 (ONNX classifier) -> threshold
-decision. Layer 3 and the output scanner are integrated later; Layer 3 is a
-stub for now.
+Input side, run_pipeline():
+    Layer 1 (deterministic) -> Layer 2 (ONNX classifier) -> threshold decision.
+    Prompts in the ambiguous Layer 2 band are escalated to Layer 3 (local
+    reasoning judge), which returns ALLOW, BLOCK or REDACT.
+
+Output side, scan_output():
+    Checks the LLM completion for system-prompt leakage and PII/secrets
+    before it goes back to the client.
+
+Exceptions: neither function swallows unexpected errors. handler.py owns the
+fail-open / fail-closed policy (FIREWALL_FAIL_OPEN).
+
+Note on scan_output: the Week 2 contract defines it here, but handler.py calls
+it as `output_scanner.scan_output(...)`. The bottom of this module publishes it
+under both names so each caller finds it.
 """
 
+import inspect
 import logging
 import os
 import time
@@ -15,7 +28,14 @@ from dataclasses import dataclass, field
 import yaml
 
 from src.engine.layer_1_deterministic import layer1_engine
+from src.engine import output_scanner as _output_scanner_module
 from src.engine.layer_2_classifier import ClassifierUnavailable, get_classifier
+from src.engine.layer_3_evaluator import Layer3Result, evaluate_layer3
+from src.engine.output_scanner import (
+    OutputScanResult,
+    detect_pii,
+    detect_system_prompt_leak,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +44,9 @@ DEFAULT_CONFIG_PATH = os.getenv("FIREWALL_CONFIG_PATH", "config/firewall.yaml")
 
 class PipelineConfigError(ValueError):
     """firewall.yaml is invalid. Startup must abort."""
+
+
+OUTPUT_ON_DETECT_CHOICES = frozenset({"block", "redact", "warn"})
 
 
 @dataclass(frozen=True)
@@ -35,6 +58,8 @@ class PipelineConfig:
     low_confidence_threshold: float = 0.30
     max_context_turns: int = 5
     max_context_chars: int = 2000        
+    output_scanner_enabled: bool = True
+    output_on_detect: str = "redact"      # block | redact | warn
 
     def __post_init__(self):
         for name in ("high_confidence_threshold", "low_confidence_threshold"):
@@ -49,6 +74,11 @@ class PipelineConfig:
             )
         if self.max_context_turns < 0 or self.max_context_chars < 1:
             raise PipelineConfigError("max_context_turns must be >= 0 and max_context_chars >= 1")
+        if self.output_on_detect not in OUTPUT_ON_DETECT_CHOICES:
+            raise PipelineConfigError(
+                f"output_scanner.on_detect must be one of "
+                f"{sorted(OUTPUT_ON_DETECT_CHOICES)}, got {self.output_on_detect!r}"
+            )
 
 
 def _get_bool(section: dict, key: str, default: bool) -> bool:
@@ -56,6 +86,13 @@ def _get_bool(section: dict, key: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise PipelineConfigError(f"'{key}' must be true or false, got {value!r}")
     return value
+
+
+def _get_choice(section: dict, key: str, default: str, choices) -> str:
+    value = section.get(key, default)
+    if not isinstance(value, str) or value.strip().lower() not in choices:
+        raise PipelineConfigError(f"'{key}' must be one of {sorted(choices)}, got {value!r}")
+    return value.strip().lower()
 
 
 def _get_number(section: dict, key: str, default, kind=float):
@@ -79,6 +116,7 @@ def load_pipeline_config(path) -> PipelineConfig:
 
     pipeline = raw.get("pipeline") or {}
     layer2 = raw.get("layer_2") or {}
+    scanner = raw.get("output_scanner") or {}
     d = PipelineConfig()
 
     return PipelineConfig(
@@ -89,6 +127,8 @@ def load_pipeline_config(path) -> PipelineConfig:
         low_confidence_threshold=_get_number(layer2, "low_confidence_threshold", d.low_confidence_threshold),
         max_context_turns=_get_number(layer2, "max_context_turns", d.max_context_turns, int),
         max_context_chars=_get_number(layer2, "max_context_chars", d.max_context_chars, int),
+        output_scanner_enabled=_get_bool(pipeline, "output_scanner_enabled", d.output_scanner_enabled),
+        output_on_detect=_get_choice(scanner, "on_detect", d.output_on_detect, OUTPUT_ON_DETECT_CHOICES),
     )
 
 
@@ -120,7 +160,7 @@ class PipelineResult:
     # --- Week 2 ---
     layer2_score: float | None = None
     sanitized_prompt: str | None = None   
-    decision: str = "PASS"              
+    decision: str = "PASS"              # final decision: PASS | BLOCK | REDACT (ESCALATE only inside layer_details)
 
 
 def new_request_id() -> str:
@@ -131,14 +171,19 @@ def _ms_since(t0: float) -> float:
     return (time.perf_counter() - t0) * 1000
 
 
-def _build_layer2_text(prompt: str, context, cfg: PipelineConfig) -> tuple[str, int]:
-    """Earlier user turns (capped) + current prompt LAST. Returns (text, turns_used)."""
+def _capped_turns(context, cfg: PipelineConfig) -> list[str]:
+    """Earlier user turns, cleaned and capped by count and length."""
     turns = [t.strip() for t in (context or []) if isinstance(t, str) and t.strip()]
     if cfg.max_context_turns:
         turns = turns[-cfg.max_context_turns:]  
     else:
         turns = []
-    turns = [t[: cfg.max_context_chars] for t in turns]
+    return [t[: cfg.max_context_chars] for t in turns]
+
+
+def _build_layer2_text(prompt: str, context, cfg: PipelineConfig) -> tuple[str, int]:
+    """Earlier user turns (capped) + current prompt LAST. Returns (text, turns_used)."""
+    turns = _capped_turns(context, cfg)
     return "\n".join(turns + [prompt]), len(turns)
 
 
@@ -178,6 +223,81 @@ async def _run_layer2(prompt, context, cfg, layer_details) -> float | None:
         "context_turns": turns_used,
     }
     return res.score
+
+
+_RATIONALE_MAX_CHARS = 300
+_LAYER3_DECISIONS = frozenset({"ALLOW", "BLOCK", "REDACT"})
+
+
+async def _escalate_to_layer3(
+    prompt: str,
+    system_instruction: str,
+    context,
+    cfg: PipelineConfig,
+    score: float,
+    request_id: str,
+    start: float,
+    layer_details: dict,
+) -> PipelineResult:
+    """Layer 2 was unsure: let the Layer 3 judge decide (or skip it if disabled).
+
+    Fails closed: a REDACT with nothing to forward, or a decision we do not
+    recognise, becomes a BLOCK.
+    """
+    if not cfg.layer_3_enabled:
+        layer_details["layer_3"] = {"status": "disabled"}
+        return PipelineResult(
+            request_id=request_id, is_blocked=False, action_taken="PASSED",
+            triggered_layer="NONE", risk_score=score, layer2_score=score,
+            execution_time_ms=_ms_since(start), layer_details=layer_details,
+            decision="PASS",
+        )
+
+    l3: Layer3Result = await evaluate_layer3(prompt, system_instruction, _capped_turns(context, cfg))
+    decision = (l3.decision or "").strip().upper()
+
+    details = {
+        "status": "degraded" if l3.degraded else "ok",
+        "decision": decision,                     # what Layer 3 actually answered
+        "time_ms": round(l3.latency_ms, 4),
+        "degraded": l3.degraded,
+        "rationale": (l3.rationale or "")[:_RATIONALE_MAX_CHARS],
+    }
+    layer_details["layer_3"] = details
+    if l3.degraded:
+        logger.warning("Layer 3 degraded for request %s; fallback decision was %s.",
+                       request_id, decision or "<empty>")
+
+    if decision not in _LAYER3_DECISIONS:
+        details["downgraded"] = "unknown_decision"
+        decision = "BLOCK"
+    elif decision == "REDACT" and not (l3.sanitized_prompt or "").strip():
+        details["downgraded"] = "redact_without_sanitized_prompt"
+        decision = "BLOCK"
+
+    if decision == "BLOCK":
+        return PipelineResult(
+            request_id=request_id, is_blocked=True, action_taken="BLOCKED",
+            triggered_layer="LAYER_3", risk_score=score, layer2_score=score,
+            execution_time_ms=_ms_since(start), layer_details=layer_details,
+            decision="BLOCK",
+        )
+
+    if decision == "REDACT":
+        return PipelineResult(
+            request_id=request_id, is_blocked=False, action_taken="REDACTED",
+            triggered_layer="LAYER_3", risk_score=score, layer2_score=score,
+            sanitized_prompt=l3.sanitized_prompt,
+            execution_time_ms=_ms_since(start), layer_details=layer_details,
+            decision="REDACT",
+        )
+
+    return PipelineResult(                        # ALLOW
+        request_id=request_id, is_blocked=False, action_taken="PASSED",
+        triggered_layer="NONE", risk_score=score, layer2_score=score,
+        execution_time_ms=_ms_since(start), layer_details=layer_details,
+        decision="PASS",
+    )
 
 
 async def run_pipeline(
@@ -234,8 +354,9 @@ async def run_pipeline(
         )
 
     if decision == "ESCALATE":
-        # TEMPORARY: P4 replaces this with the real Layer 3 call on Wednesday.
-        layer_details["layer_3"] = {"status": "pending_integration"}
+        return await _escalate_to_layer3(
+            prompt, system_instruction, context, cfg, score, request_id, start, layer_details,
+        )
 
     return PipelineResult(
         request_id=request_id, is_blocked=False, action_taken="PASSED",
@@ -243,3 +364,53 @@ async def run_pipeline(
         execution_time_ms=_ms_since(start), layer_details=layer_details,
         decision=decision,
     )
+
+
+# ======================================================================
+# Output side
+# ======================================================================
+async def scan_output(
+    completion_text: str,
+    system_instruction: str,
+    request_id: str,
+) -> OutputScanResult:
+    """Scan an LLM completion for system-prompt leakage and PII/secrets.
+
+    Returns OutputScanResult(flagged, categories, spans, action) where action
+    is PASS when nothing was found, otherwise the configured
+    output_scanner.on_detect policy (BLOCK | REDACT | WARN).
+
+    Never logs the completion or the matched text, only counts and categories.
+    Errors from the detectors are not swallowed; handler.py applies the
+    FIREWALL_FAIL_OPEN policy.
+    """
+    cfg = get_pipeline_config()
+    if not cfg.output_scanner_enabled:
+        return OutputScanResult(flagged=False, action="PASS")
+
+    spans = list(detect_system_prompt_leak(completion_text, system_instruction))
+
+    # detect_pii loads its rules from the database, so it is async. Accept a
+    # plain list too, so a sync detector (or a test double) keeps working.
+    pii_spans = detect_pii(completion_text)
+    if inspect.isawaitable(pii_spans):
+        pii_spans = await pii_spans
+    spans.extend(pii_spans)
+
+    spans.sort(key=lambda sp: (sp.start, sp.end))
+    flagged = bool(spans)
+    categories = sorted({sp.category for sp in spans})
+    action = cfg.output_on_detect.upper() if flagged else "PASS"
+
+    if flagged:
+        logger.warning(
+            "Output scanner flagged request %s: %d span(s), categories=%s, action=%s",
+            request_id, len(spans), categories, action,
+        )
+
+    return OutputScanResult(flagged=flagged, categories=categories, spans=spans, action=action)
+
+
+# handler.py calls output_scanner.scan_output(...); the contract defines the
+# function in this module. Publish it on the scanner module too.
+_output_scanner_module.scan_output = scan_output
