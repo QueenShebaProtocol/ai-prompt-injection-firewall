@@ -37,8 +37,8 @@ from src.engine.output_scanner import (
 
 ROOT = Path(__file__).resolve().parents[1]
 
-P1_LEAK_MERGED = False
-P2_SECRET_CONVENTION_FIXED = False
+P1_LEAK_MERGED = True
+P2_SECRET_CONVENTION_FIXED = False 
 
 needs_leak_detection = pytest.mark.xfail(
     not P1_LEAK_MERGED,

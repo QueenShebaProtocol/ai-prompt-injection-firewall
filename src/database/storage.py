@@ -19,9 +19,14 @@ Functions in this file:
 - search_threat_logs, get_log_detail
 - get_active_output_scanner_rules
     Week 2 Friday, P5
+- get_risk_score_histogram, get_top_patterns, get_top_client_ips,
+  get_latency_series, get_output_flag_counts, export_threat_logs,
+  list_rules, create_rule, update_rule, delete_rule
+    Week 3 Monday, P5
 """
 
 import asyncio
+import re
 import copy
 import functools
 import logging
@@ -32,8 +37,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
-from sqlalchemy import and_, func, literal_column, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import and_, func, literal_column, select, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database.connection import AsyncSessionLocal
 from src.database.models import (
@@ -452,6 +458,7 @@ async def write_audit_log(
     before: Any = None,
     after: Any = None,
     details: Mapping[str, Any] | None = None,
+    session: AsyncSession | None = None,
 ) -> None:
     """Write one administrative action to `admin_audit_logs`.
 
@@ -496,6 +503,12 @@ async def write_audit_log(
         details:
             Optional additional JSON-serializable metadata.
 
+        session:
+            Optional open session. When given, the audit row is only added
+            to it (not committed), so the caller can commit it together with
+            the change it describes. When omitted, the row gets its own
+            session and is committed immediately (the Week 2 behaviour).
+
     Raises:
         ValueError:
             If the administrator or action is invalid.
@@ -538,12 +551,15 @@ async def write_audit_log(
         "change_details": change_details,
     }
 
-    async with AsyncSessionLocal() as session:
-        audit_log = AdminAuditLog(**audit_entry)
+    audit_log = AdminAuditLog(**audit_entry)
 
+    if session is not None:
+        # The caller owns the transaction and commits it.
         session.add(audit_log)
-
-        await session.commit()
+    else:
+        async with AsyncSessionLocal() as own_session:
+            own_session.add(audit_log)
+            await own_session.commit()
 
     logger.info(
         "Administrative audit event recorded: "
@@ -939,3 +955,506 @@ async def get_active_output_scanner_rules(category: str = "PII") -> list[dict]:
         }
         for r in rules
     ]
+
+# =============================================================================
+# Week 3 Monday (P5) - more dashboard queries, export, and rule management
+# =============================================================================
+
+MAX_TOP_N = 50
+MAX_HISTOGRAM_BINS = 100
+EXPORT_MAX_ROWS = 10_000
+MAX_PATTERN_CHARS = 2000
+
+_VALID_RULE_TYPES = {"REGEX", "KEYWORD", "EXCLUSION"}
+_VALID_SEVERITIES = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
+
+
+def _clamp_top_n(limit: int) -> int:
+    return min(max(1, int(limit)), MAX_TOP_N)
+
+
+@ttl_cache(30)
+async def get_risk_score_histogram(hours: int = 24, bins: int = 10) -> list[dict]:
+    """Requests per risk-score range, lowest range first.
+
+    Always returns exactly `bins` entries (empty ranges have count 0):
+        [{"bin_start": 0.0, "bin_end": 0.1, "count": 12}, ...]
+    The last range also contains a score of exactly 1.0.
+    """
+    bins = int(bins)
+    if not 1 <= bins <= MAX_HISTOGRAM_BINS:
+        raise ValueError(f"bins must be between 1 and {MAX_HISTOGRAM_BINS}, got {bins}")
+    start, end = _window(hours)
+
+    # `bins` is a validated int. It is written as a literal (not a bind
+    # parameter) so the SELECT and GROUP BY expressions are identical.
+    bin_index = func.greatest(
+        literal_column("0"),
+        func.least(
+            func.floor(ThreatLog.risk_score * literal_column(str(bins))),
+            literal_column(str(bins - 1)),
+        ),
+    )
+    stmt = (
+        select(bin_index.label("bin_no"), func.count().label("hits"))
+        .where(ThreatLog.created_at >= start, ThreatLog.created_at < end)
+        .group_by(bin_index)
+        .order_by(bin_index)
+    )
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(stmt)).all()
+
+    counts = {int(r.bin_no): int(r.hits) for r in rows}
+    return [
+        {
+            "bin_start": round(i / bins, 4),
+            "bin_end": round((i + 1) / bins, 4),
+            "count": counts.get(i, 0),
+        }
+        for i in range(bins)
+    ]
+
+
+_TOP_PATTERNS_SQL = text(
+    """
+    SELECT p.pattern AS pattern, COUNT(*) AS hits
+    FROM threat_logs AS t
+    CROSS JOIN LATERAL jsonb_array_elements_text(t.detected_patterns) AS p(pattern)
+    WHERE t.created_at >= :start
+      AND t.created_at < :end
+      AND jsonb_typeof(t.detected_patterns) = 'array'
+    GROUP BY p.pattern
+    ORDER BY hits DESC, p.pattern
+    LIMIT :limit
+    """
+)
+
+
+@ttl_cache(30)
+async def get_top_patterns(hours: int = 24, limit: int = 10) -> list[dict]:
+    """Most frequently matched rule IDs: [{"pattern": "RULE_...", "count": 7}, ...]."""
+    start, end = _window(hours)
+    params = {"start": start, "end": end, "limit": _clamp_top_n(limit)}
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(_TOP_PATTERNS_SQL, params)).all()
+    return [{"pattern": r.pattern, "count": int(r.hits)} for r in rows]
+
+
+@ttl_cache(30)
+async def get_top_client_ips(hours: int = 24, limit: int = 10) -> list[dict]:
+    """Busiest client IPs, most blocked requests first:
+    [{"client_ip": "10.0.0.5", "total_requests": 40, "blocked_requests": 9}, ...]
+    """
+    start, end = _window(hours)
+    total = func.count().label("total_requests")
+    blocked = func.count().filter(ThreatLog.is_blocked.is_(True)).label("blocked_requests")
+    stmt = (
+        select(ThreatLog.client_ip, total, blocked)
+        .where(ThreatLog.created_at >= start, ThreatLog.created_at < end)
+        .group_by(ThreatLog.client_ip)
+        .order_by(blocked.desc(), total.desc(), ThreatLog.client_ip)
+        .limit(_clamp_top_n(limit))
+    )
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(stmt)).all()
+    return [
+        {
+            "client_ip": r.client_ip,
+            "total_requests": int(r.total_requests),
+            "blocked_requests": int(r.blocked_requests),
+        }
+        for r in rows
+    ]
+
+
+@ttl_cache(30)
+async def get_latency_series(hours: int = 168) -> list[dict]:
+    """Hourly latency from the pre-aggregated system_metrics table, oldest first:
+    [{"bucket_start": dt, "avg_latency_ms": 3.2, "p95_latency_ms": 9.1,
+      "total_requests": 120}, ...]
+    Hours with no traffic are left out (their 0.0 latency would be misleading).
+    """
+    start, _ = _window(hours)
+    stmt = (
+        select(
+            SystemMetric.bucket_start,
+            SystemMetric.avg_latency_ms,
+            SystemMetric.p95_latency_ms,
+            SystemMetric.total_requests,
+        )
+        .where(SystemMetric.bucket_start >= start, SystemMetric.total_requests > 0)
+        .order_by(SystemMetric.bucket_start)
+    )
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(stmt)).all()
+    return [
+        {
+            "bucket_start": r.bucket_start,
+            "avg_latency_ms": float(r.avg_latency_ms),
+            "p95_latency_ms": float(r.p95_latency_ms),
+            "total_requests": int(r.total_requests),
+        }
+        for r in rows
+    ]
+
+
+@ttl_cache(30)
+async def get_output_flag_counts(hours: int = 24) -> dict:
+    """Output-scanner activity:
+    {"total_requests": n, "flagged": n, "blocked": n, "flag_rate": 0.0-1.0}
+    flagged = completions the scanner flagged; blocked = ones it blocked.
+    """
+    start, end = _window(hours)
+    stmt = select(
+        func.count().label("total_requests"),
+        func.count().filter(ThreatLog.output_flagged.is_(True)).label("flagged"),
+        func.count()
+        .filter(
+            and_(
+                ThreatLog.triggered_layer == "OUTPUT_SCANNER",
+                ThreatLog.is_blocked.is_(True),
+            )
+        )
+        .label("blocked"),
+    ).where(ThreatLog.created_at >= start, ThreatLog.created_at < end)
+    async with AsyncSessionLocal() as session:
+        row = (await session.execute(stmt)).one()
+
+    total = int(row.total_requests)
+    flagged = int(row.flagged)
+    return {
+        "total_requests": total,
+        "flagged": flagged,
+        "blocked": int(row.blocked),
+        "flag_rate": (flagged / total) if total else 0.0,
+    }
+
+
+# --- Export -------------------------------------------------------------------
+async def export_threat_logs(
+    filters: LogFilters | None = None,
+    max_rows: int = EXPORT_MAX_ROWS,
+) -> list[dict]:
+    """Rows matching `filters` (same filters as search), newest first, no paging.
+
+    At most `max_rows` rows, and never more than EXPORT_MAX_ROWS. If the result
+    has exactly `max_rows` rows the cap may have applied; compare with
+    search_threat_logs(filters).total to tell the user.
+    Includes the full raw_prompt. system_instruction and output_completion are
+    left out on purpose (large and sensitive). Not cached.
+    """
+    max_rows = min(max(1, int(max_rows)), EXPORT_MAX_ROWS)
+    stmt = _apply_filters(
+        select(
+            ThreatLog.created_at,
+            ThreatLog.request_id,
+            ThreatLog.client_ip,
+            ThreatLog.application_id,
+            ThreatLog.target_model,
+            ThreatLog.is_blocked,
+            ThreatLog.action_taken,
+            ThreatLog.triggered_layer,
+            ThreatLog.risk_score,
+            ThreatLog.execution_time_ms,
+            ThreatLog.output_flagged,
+            ThreatLog.detected_patterns,
+            ThreatLog.raw_prompt,
+        ),
+        filters,
+    )
+    stmt = stmt.order_by(ThreatLog.created_at.desc(), ThreatLog.id.desc()).limit(max_rows)
+
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(stmt)).mappings().all()
+    return [dict(r) for r in rows]
+
+
+# --- Rule management (every change is audited in the same transaction) ---------
+class RuleValidationError(ValueError):
+    """The rule data is invalid (missing field, bad value, broken regex, ...)."""
+
+
+class DuplicateRuleError(RuleValidationError):
+    """A rule with this rule_id already exists."""
+
+
+class RuleNotFoundError(LookupError):
+    """No rule with this rule_id exists."""
+
+
+_REQUIRED_RULE_FIELDS = ("rule_id", "rule_type", "category", "pattern", "severity")
+_UPDATABLE_RULE_FIELDS = (
+    "rule_type", "category", "pattern", "description", "severity", "is_active",
+)
+_SNAPSHOT_FIELDS = (
+    "rule_id", "rule_type", "category", "pattern", "description", "severity", "is_active",
+)
+_ENUM_RULE_FIELDS = {
+    "rule_type": _VALID_RULE_TYPES,
+    "category": _VALID_RULE_CATEGORIES,
+    "severity": _VALID_SEVERITIES,
+}
+_RULE_ID_PATTERN = re.compile(r"[A-Za-z0-9_.\-]{1,100}")
+
+
+def _require_admin(admin_user: str) -> str:
+    if not isinstance(admin_user, str) or not admin_user.strip():
+        raise ValueError("admin_user must be a non-empty string")
+    return admin_user.strip()
+
+
+def _require_rule_id(rule_id: str) -> str:
+    if not isinstance(rule_id, str) or not rule_id.strip():
+        raise RuleValidationError("rule_id must be a non-empty string")
+    return rule_id.strip()
+
+
+def _clean_rule_value(name: str, value: Any) -> Any:
+    if name == "is_active":
+        if not isinstance(value, bool):
+            raise RuleValidationError("is_active must be true or false")
+        return value
+    if name == "description":
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise RuleValidationError("description must be text")
+        return value.strip() or None
+    if not isinstance(value, str):
+        raise RuleValidationError(f"{name} must be text")
+    if name in _ENUM_RULE_FIELDS:
+        return value.strip().upper()
+    if name == "rule_id":
+        return value.strip()
+    return value  # pattern: kept exactly as typed
+
+
+def _validate_rule(rule: Mapping[str, Any]) -> None:
+    """Check a COMPLETE rule dictionary."""
+    if not _RULE_ID_PATTERN.fullmatch(rule.get("rule_id") or ""):
+        raise RuleValidationError(
+            "rule_id must be 1-100 characters: letters, digits, '_', '-' or '.'"
+        )
+    for name, allowed in _ENUM_RULE_FIELDS.items():
+        if rule.get(name) not in allowed:
+            raise RuleValidationError(
+                f"{name} must be one of {sorted(allowed)}, got {rule.get(name)!r}"
+            )
+    pattern = rule.get("pattern")
+    if not isinstance(pattern, str) or not pattern.strip():
+        raise RuleValidationError("pattern must not be empty")
+    if len(pattern) > MAX_PATTERN_CHARS:
+        raise RuleValidationError(f"pattern is longer than {MAX_PATTERN_CHARS} characters")
+    if rule["rule_type"] == "REGEX":
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise RuleValidationError(
+                f"pattern is not a valid regular expression: {exc}"
+            ) from exc
+
+
+def _prepare_new_rule(rule: Mapping[str, Any]) -> dict:
+    if not isinstance(rule, Mapping):
+        raise RuleValidationError("rule must be a dictionary")
+    missing = [k for k in _REQUIRED_RULE_FIELDS if k not in rule]
+    if missing:
+        raise RuleValidationError(f"Missing required fields: {', '.join(missing)}")
+    unknown = sorted(set(rule) - set(_REQUIRED_RULE_FIELDS) - {"description", "is_active"})
+    if unknown:
+        raise RuleValidationError(f"Unknown fields: {', '.join(unknown)}")
+    data = {name: _clean_rule_value(name, value) for name, value in rule.items()}
+    data.setdefault("description", None)
+    data.setdefault("is_active", True)
+    _validate_rule(data)
+    return data
+
+
+def _prepare_rule_changes(changes: Mapping[str, Any]) -> dict:
+    if not isinstance(changes, Mapping) or not changes:
+        raise RuleValidationError("changes must be a non-empty dictionary")
+    if "rule_id" in changes:
+        raise RuleValidationError(
+            "rule_id cannot be changed; delete the rule and create a new one"
+        )
+    unknown = sorted(set(changes) - set(_UPDATABLE_RULE_FIELDS))
+    if unknown:
+        raise RuleValidationError(f"Cannot change fields: {', '.join(unknown)}")
+    return {name: _clean_rule_value(name, value) for name, value in changes.items()}
+
+
+def _rule_snapshot(rule) -> dict:
+    """The editable fields only. This is what goes into the audit row."""
+    return {name: getattr(rule, name) for name in _SNAPSHOT_FIELDS}
+
+
+def _rule_to_dict(rule) -> dict:
+    data = _rule_snapshot(rule)
+    data["created_at"] = rule.created_at
+    data["updated_at"] = rule.updated_at
+    return data
+
+
+def _is_unique_violation(exc: IntegrityError) -> bool:
+    orig = getattr(exc, "orig", None)
+    code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return code == "23505" or "duplicate key" in str(orig).lower()
+
+
+async def _get_rule_for_update(session: AsyncSession, rule_id: str) -> FirewallRule:
+    stmt = select(FirewallRule).where(FirewallRule.rule_id == rule_id).with_for_update()
+    rule = (await session.execute(stmt)).scalar_one_or_none()
+    if rule is None:
+        raise RuleNotFoundError(f"Rule {rule_id!r} does not exist")
+    return rule
+
+
+async def list_rules(
+    category: str | None = None,
+    rule_type: str | None = None,
+    active_only: bool = False,
+) -> list[dict]:
+    """Rules as dictionaries, ordered by category then rule_id. Not cached."""
+    category = category.strip().upper() if category else None
+    rule_type = rule_type.strip().upper() if rule_type else None
+    if category is not None and category not in _VALID_RULE_CATEGORIES:
+        raise ValueError(f"Unknown rule category: {category!r}")
+    if rule_type is not None and rule_type not in _VALID_RULE_TYPES:
+        raise ValueError(f"Unknown rule type: {rule_type!r}")
+
+    stmt = select(FirewallRule).order_by(FirewallRule.category, FirewallRule.rule_id)
+    if category:
+        stmt = stmt.where(FirewallRule.category == category)
+    if rule_type:
+        stmt = stmt.where(FirewallRule.rule_type == rule_type)
+    if active_only:
+        stmt = stmt.where(FirewallRule.is_active.is_(True))
+
+    async with AsyncSessionLocal() as session:
+        rules = (await session.execute(stmt)).scalars().all()
+    return [_rule_to_dict(r) for r in rules]
+
+
+async def create_rule(rule: Mapping[str, Any], admin_user: str) -> dict:
+    """Create a rule and its RULE_CREATED audit row in ONE transaction.
+
+    Required keys: rule_id, rule_type, category, pattern, severity.
+    Optional: description, is_active (default True).
+    Raises RuleValidationError (bad data) or DuplicateRuleError (rule_id exists).
+    """
+    admin = _require_admin(admin_user)
+    data = _prepare_new_rule(rule)
+
+    async with AsyncSessionLocal() as session:
+        try:
+            exists = (
+                await session.execute(
+                    select(FirewallRule.id).where(FirewallRule.rule_id == data["rule_id"])
+                )
+            ).first()
+            if exists is not None:
+                raise DuplicateRuleError(f"A rule with rule_id {data['rule_id']!r} already exists")
+
+            obj = FirewallRule(**data)
+            session.add(obj)
+            await session.flush()  # a duplicate that slipped past the check fails here
+            await write_audit_log(
+                admin_user=admin,
+                action="RULE_CREATED",
+                target_rule_id=data["rule_id"],
+                before=None,
+                after=_rule_snapshot(obj),
+                session=session,
+            )
+            await session.commit()
+        except IntegrityError as exc:
+            await session.rollback()
+            if _is_unique_violation(exc):
+                raise DuplicateRuleError(
+                    f"A rule with rule_id {data['rule_id']!r} already exists"
+                ) from exc
+            logger.error("create_rule rejected by the database", exc_info=True)
+            raise RuleValidationError("The database rejected this rule") from exc
+        except Exception:
+            await session.rollback()
+            raise
+        result = _rule_to_dict(obj)
+
+    logger.info("Rule %s created by %s", data["rule_id"], admin)
+    return result
+
+
+async def update_rule(rule_id: str, changes: Mapping[str, Any], admin_user: str) -> dict:
+    """Change some fields of a rule and write its RULE_UPDATED audit row (one commit).
+
+    `changes` may contain: rule_type, category, pattern, description, severity,
+    is_active (rule_id cannot change). If nothing actually changes, nothing is
+    saved and no audit row is written. Raises RuleNotFoundError / RuleValidationError.
+    """
+    admin = _require_admin(admin_user)
+    rule_id = _require_rule_id(rule_id)
+    clean = _prepare_rule_changes(changes)
+
+    async with AsyncSessionLocal() as session:
+        try:
+            obj = await _get_rule_for_update(session, rule_id)
+            before = _rule_snapshot(obj)
+            after = {**before, **clean}
+            _validate_rule(after)
+
+            if after == before:
+                unchanged = _rule_to_dict(obj)
+                await session.rollback()  # releases the row lock
+                return unchanged
+
+            for name, value in clean.items():
+                setattr(obj, name, value)
+            await session.flush()
+            await write_audit_log(
+                admin_user=admin,
+                action="RULE_UPDATED",
+                target_rule_id=rule_id,
+                before=before,
+                after=after,
+                session=session,
+            )
+            await session.commit()
+        except IntegrityError as exc:
+            await session.rollback()
+            logger.error("update_rule rejected by the database", exc_info=True)
+            raise RuleValidationError("The database rejected this change") from exc
+        except Exception:
+            await session.rollback()
+            raise
+        result = _rule_to_dict(obj)
+
+    logger.info("Rule %s updated by %s", rule_id, admin)
+    return result
+
+
+async def delete_rule(rule_id: str, admin_user: str) -> None:
+    """Delete a rule and write its RULE_DELETED audit row (one commit).
+    Raises RuleNotFoundError if the rule does not exist."""
+    admin = _require_admin(admin_user)
+    rule_id = _require_rule_id(rule_id)
+
+    async with AsyncSessionLocal() as session:
+        try:
+            obj = await _get_rule_for_update(session, rule_id)
+            before = _rule_snapshot(obj)
+            await session.delete(obj)
+            await session.flush()
+            await write_audit_log(
+                admin_user=admin,
+                action="RULE_DELETED",
+                target_rule_id=rule_id,
+                before=before,
+                after=None,
+                session=session,
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+    logger.info("Rule %s deleted by %s", rule_id, admin)
