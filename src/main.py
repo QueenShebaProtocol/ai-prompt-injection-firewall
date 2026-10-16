@@ -118,7 +118,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Decentralized AI Prompt Injection Firewall",
     description="Inline security proxy for LLM traffic: layered prompt inspection and output scanning.",
-    version="0.2.0",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
