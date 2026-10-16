@@ -36,6 +36,9 @@ from src.engine.output_scanner import (
     detect_pii,
     detect_system_prompt_leak,
 )
+import threading
+...
+from dataclasses import dataclass, field, fields
 
 logger = logging.getLogger(__name__)
 
@@ -102,17 +105,94 @@ def _get_number(section: dict, key: str, default, kind=float):
     return kind(value)
 
 
-def load_pipeline_config(path) -> PipelineConfig:
+# ----------------------------------------------------------------------
+# Runtime config overlay (Week 3)
+# ----------------------------------------------------------------------
+# The dashboard writes a runtime copy of firewall.yaml (path in
+# FIREWALL_RUNTIME_CONFIG_PATH). Only the keys below are honoured from it;
+# everything else in that file is ignored.
+RUNTIME_CONFIG_ENV = "FIREWALL_RUNTIME_CONFIG_PATH"
+RUNTIME_POLL_SECONDS = 1.0
+RUNTIME_OVERLAY_KEYS: dict[str, tuple[str, ...]] = {
+    "pipeline": (
+        "layer_1_enabled",
+        "layer_2_enabled",
+        "layer_3_enabled",
+        "output_scanner_enabled",
+    ),
+    "layer_2": ("high_confidence_threshold", "low_confidence_threshold"),
+    "output_scanner": ("on_detect",),
+}
+
+
+def _read_yaml_mapping(path, label: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
     except FileNotFoundError as exc:
-        raise PipelineConfigError(f"Config file not found: {path}") from exc
+        raise PipelineConfigError(f"{label} not found: {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise PipelineConfigError(f"{label} is not valid UTF-8: {exc}") from exc
+    except OSError as exc:
+        raise PipelineConfigError(f"{label} could not be read: {exc}") from exc
     except yaml.YAMLError as exc:
-        raise PipelineConfigError(f"Config file is not valid YAML: {exc}") from exc
+        raise PipelineConfigError(f"{label} is not valid YAML: {exc}") from exc
 
     if not isinstance(raw, dict):
-        raise PipelineConfigError("Config root must be a mapping")
+        raise PipelineConfigError(f"{label} root must be a mapping")
+    return raw
+
+
+def _read_runtime_overlay(path) -> dict:
+    """Read the runtime file and keep only the whitelisted keys."""
+    raw = _read_yaml_mapping(path, "Runtime config file")
+    overlay: dict[str, dict] = {}
+    ignored: list[str] = []
+
+    for section, values in raw.items():
+        allowed = RUNTIME_OVERLAY_KEYS.get(section)
+        if allowed is None:
+            ignored.append(str(section))
+            continue
+        if values is None:
+            continue
+        if not isinstance(values, dict):
+            raise PipelineConfigError(f"Runtime config section '{section}' must be a mapping")
+        kept = {k: v for k, v in values.items() if k in allowed}
+        ignored.extend(f"{section}.{k}" for k in values if k not in allowed)
+        if kept:
+            overlay[section] = kept
+
+    if ignored:  # the runtime file is a full copy of firewall.yaml, so this is normal
+        logger.debug("Runtime config: ignoring keys that are not runtime-editable: %s",
+                     sorted(ignored))
+    return overlay
+
+
+def _merge_overlay(raw: dict, overlay: dict) -> dict:
+    merged = dict(raw)
+    for section, values in overlay.items():
+        base = merged.get(section) or {}
+        if not isinstance(base, dict):
+            raise PipelineConfigError(f"Config section '{section}' must be a mapping")
+        merged[section] = {**base, **values}
+    return merged
+
+
+def load_pipeline_config(path, runtime_path=None) -> PipelineConfig:
+    """Read firewall.yaml and overlay the runtime config file on top of it.
+
+    runtime_path: None  -> use FIREWALL_RUNTIME_CONFIG_PATH if it is set;
+                  ""    -> no overlay (packaged file only);
+                  other -> that file. A missing overlay file is simply skipped.
+    Raises PipelineConfigError for an invalid packaged OR runtime file.
+    """
+    raw = _read_yaml_mapping(path, "Config file")
+
+    if runtime_path is None:
+        runtime_path = os.getenv(RUNTIME_CONFIG_ENV, "")
+    if runtime_path and os.path.exists(runtime_path):
+        raw = _merge_overlay(raw, _read_runtime_overlay(runtime_path))
 
     pipeline = raw.get("pipeline") or {}
     layer2 = raw.get("layer_2") or {}
@@ -134,6 +214,67 @@ def load_pipeline_config(path) -> PipelineConfig:
 
 _config: PipelineConfig | None = None
 
+# Runtime-file polling state
+_runtime_lock = threading.Lock()
+_runtime_signature: tuple | None = None   # (path, mtime_ns, size) of the last version we looked at
+_runtime_next_check: float = 0.0          # time.monotonic() before which we do not look again
+
+
+def _config_diff(old: PipelineConfig | None, new: PipelineConfig) -> str:
+    if old is None:
+        return "initial load"
+    changes = [
+        f"{f.name}: {getattr(old, f.name)!r} -> {getattr(new, f.name)!r}"
+        for f in fields(PipelineConfig)
+        if getattr(old, f.name) != getattr(new, f.name)
+    ]
+    return "; ".join(changes) or "no effective change"
+
+
+def _refresh_runtime_config(force: bool = False) -> None:
+    """Pick up changes to the runtime config file.
+
+    Cheap: one os.stat, and at most once per RUNTIME_POLL_SECONDS. An invalid
+    file is logged ONCE and ignored; the last good config stays in force. Never
+    raises, because this runs on the request path.
+    """
+    global _config, _runtime_signature, _runtime_next_check
+
+    path = os.getenv(RUNTIME_CONFIG_ENV, "")
+    if not path:
+        return
+    if not force and time.monotonic() < _runtime_next_check:
+        return
+
+    with _runtime_lock:
+        now = time.monotonic()
+        if not force and now < _runtime_next_check:
+            return
+        _runtime_next_check = now + RUNTIME_POLL_SECONDS
+
+        try:
+            st = os.stat(path)
+        except OSError:
+            return  # no runtime file (yet): keep the current config
+
+        signature = (path, st.st_mtime_ns, st.st_size)
+        if signature == _runtime_signature:
+            return
+        _runtime_signature = signature  # remembered even if invalid, so it is logged once
+
+        try:
+            new_cfg = load_pipeline_config(DEFAULT_CONFIG_PATH, runtime_path=path)
+        except Exception as exc:
+            logger.error(
+                "Runtime config %s was ignored; keeping the last good config. Reason: %s",
+                path, exc,
+            )
+            return
+
+        if new_cfg != _config:
+            logger.info("Runtime config reloaded from %s (%s)", path, _config_diff(_config, new_cfg))
+        _config = new_cfg  # one assignment: requests see the old or the new config, never a mix
+
 
 def set_pipeline_config(cfg: PipelineConfig) -> None:
     global _config
@@ -143,7 +284,11 @@ def set_pipeline_config(cfg: PipelineConfig) -> None:
 def get_pipeline_config() -> PipelineConfig:
     global _config
     if _config is None:
-        _config = load_pipeline_config(DEFAULT_CONFIG_PATH)
+        # Packaged file only first: if it is invalid, startup must abort.
+        _config = load_pipeline_config(DEFAULT_CONFIG_PATH, runtime_path="")
+        _refresh_runtime_config(force=True)
+    else:
+        _refresh_runtime_config()
     return _config
 
 
@@ -414,3 +559,7 @@ async def scan_output(
 # handler.py calls output_scanner.scan_output(...); the contract defines the
 # function in this module. Publish it on the scanner module too.
 _output_scanner_module.scan_output = scan_output
+
+
+
+
