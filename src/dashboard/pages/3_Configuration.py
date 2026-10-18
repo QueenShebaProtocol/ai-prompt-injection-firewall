@@ -1,4 +1,4 @@
-"""Configuration page: layer toggles, Layer 2 thresholds, rule CRUD (UI first).
+"""Configuration page: layer toggles, Layer 2 thresholds, rule CRUD.
 
 Who can do what
 - DASHBOARD_ADMIN_PASSWORD not set  -> the page is read-only and nothing can be saved.
@@ -8,11 +8,12 @@ The password check is a shared password per browser session. It is not a user
 system, and the failed-attempt lockout is per browser session only.
 
 Data
-Today all data lives in st.session_state through the small "seam" functions
-(_load_rules, _create_rule, _update_rule, _delete_rule, _load_settings,
-_save_settings). Each is marked TODO(P3, Wed): the real database and the
-runtime config file are connected there. Nothing in this file touches the
-network.
+Rules are read and changed through src/database/storage.py: each change is
+validated there and written together with its own audit row, so this page never
+writes rule audit rows itself. Settings are read from config/firewall.yaml plus
+the runtime overlay file (FIREWALL_RUNTIME_CONFIG_PATH) and written back to that
+file. A settings audit row (THRESHOLD_CHANGED) is written only after the file
+write succeeded.
 
 The page code runs inside main() so tests can import this file safely.
 """
@@ -21,16 +22,33 @@ from __future__ import annotations
 
 import copy
 import hmac
+import logging
 import os
 import re
+import sys
+import tempfile
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import streamlit as st
+import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+logger = logging.getLogger(__name__)
+
+# Make `src` importable when Streamlit runs this page as a script.
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from src.database.storage import (  # noqa: E402
+    create_rule,
+    delete_rule,
+    list_rules,
+    run_sync,
+    update_rule,
+    write_audit_log,
+)
 
 # ------------------------------------------------------------------ constants
 ADMIN_PASSWORD_ENV = "DASHBOARD_ADMIN_PASSWORD"
@@ -39,9 +57,9 @@ MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_SECONDS = 30
 
 # TODO(P3, Wed): confirm these against the database enums in src/database/models.py.
-RULE_TYPES = ("REGEX", "KEYWORD")
-CATEGORIES = ("JAILBREAK", "PROMPT_LEAK", "SYSTEM_OVERRIDE", "PII", "SECRET")
-SEVERITIES = ("LOW", "MEDIUM", "HIGH")
+RULE_TYPES = ("REGEX", "KEYWORD", "EXCLUSION")
+CATEGORIES = ("JAILBREAK", "PROMPT_LEAK", "SYSTEM_OVERRIDE", "PII")
+SEVERITIES = ("LOW", "MEDIUM", "HIGH", "CRITICAL")
 OUTPUT_ACTIONS = ("block", "redact", "warn")
 
 MAX_PATTERN_LENGTH = 500
@@ -56,8 +74,17 @@ LAYER_FLAGS = (
     ("output_scanner_enabled", "Output scanner"),
 )
 
-# Same keys as the runtime config overlay in the Week 3 contracts.
-# TODO(P3, Wed): the real starting values come from the runtime config file.
+# The runtime overlay. These are the only keys the gateway honours from the
+# runtime file (RUNTIME_OVERLAY_KEYS in src/engine/pipeline.py). Keep in sync.
+RUNTIME_CONFIG_ENV = "FIREWALL_RUNTIME_CONFIG_PATH"
+PACKAGED_CONFIG_PATH = _REPO_ROOT / "config" / "firewall.yaml"
+OVERLAY_KEYS: dict[str, tuple[str, ...]] = {
+    "pipeline": tuple(flag for flag, _label in LAYER_FLAGS),
+    "layer_2": ("high_confidence_threshold", "low_confidence_threshold"),
+    "output_scanner": ("on_detect",),
+}
+
+# Fallback values, used only if config/firewall.yaml cannot be read.
 DEFAULT_SETTINGS: dict[str, dict[str, Any]] = {
     "pipeline": {
         "layer_1_enabled": True,
@@ -65,26 +92,9 @@ DEFAULT_SETTINGS: dict[str, dict[str, Any]] = {
         "layer_3_enabled": True,
         "output_scanner_enabled": True,
     },
-    "layer_2": {"high_confidence_threshold": 0.90, "low_confidence_threshold": 0.50},
-    "output_scanner": {"on_detect": "block"},
+    "layer_2": {"high_confidence_threshold": 0.85, "low_confidence_threshold": 0.35},
+    "output_scanner": {"on_detect": "redact"},
 }
-
-
-def _seed_rules() -> list[dict[str, Any]]:
-    return [
-        {"rule_id": "RULE_SYSTEM_OVERRIDE_01", "rule_type": "REGEX", "category": "SYSTEM_OVERRIDE",
-         "pattern": r"ignore\s+(all\s+)?previous\s+instructions",
-         "description": "Attempt to override earlier instructions", "severity": "HIGH", "is_active": True},
-        {"rule_id": "RULE_DENY_01", "rule_type": "KEYWORD", "category": "JAILBREAK",
-         "pattern": "disable your safety filters",
-         "description": "Explicit request to turn off safety filtering", "severity": "HIGH", "is_active": True},
-        {"rule_id": "RULE_DENY_02", "rule_type": "KEYWORD", "category": "PROMPT_LEAK",
-         "pattern": "print your hidden instructions",
-         "description": "Explicit request to dump hidden instructions", "severity": "HIGH", "is_active": True},
-        {"rule_id": "RULE_DENY_03", "rule_type": "KEYWORD", "category": "SYSTEM_OVERRIDE",
-         "pattern": "override system prompt",
-         "description": "Explicit request to replace the system prompt", "severity": "HIGH", "is_active": True},
-    ]
 
 
 # ---------------------------------------------------------------- page chrome
@@ -289,95 +299,177 @@ def _next_deny_id(existing_ids: Iterable[str]) -> str:
     return f"RULE_DENY_{(max(numbers) + 1 if numbers else 1):02d}"
 
 
-# ---------------------------------------------------------- data seam (temp)
+# ------------------------------------------------------------- data access
+def _require_admin_user(admin_user: str) -> None:
+    if not admin_user:
+        raise PermissionError("Sign in as an admin to make changes.")
+
+
+# Rules: storage does the validation, the change and the audit row in one
+# transaction, so this page never writes rule audit rows itself.
+def _load_rules(category: str | None = None, rule_type: str | None = None) -> list[dict]:
+    return run_sync(list_rules(category, rule_type))
+
+
+def _create_rule(rule: dict, admin_user: str) -> dict:
+    _require_admin_user(admin_user)
+    return run_sync(create_rule(rule, admin_user))
+
+
+def _update_rule(rule_id: str, changes: dict, admin_user: str) -> dict:
+    _require_admin_user(admin_user)
+    allowed = {k: v for k, v in changes.items() if k in EDITABLE_FIELDS}
+    return run_sync(update_rule(rule_id, allowed, admin_user))
+
+
+def _delete_rule(rule_id: str, admin_user: str) -> None:
+    _require_admin_user(admin_user)
+    run_sync(delete_rule(rule_id, admin_user))
+
+
+# Settings: packaged config/firewall.yaml + the runtime overlay file.
+def _runtime_config_path() -> str:
+    value = os.environ.get(RUNTIME_CONFIG_ENV)
+    if value is None:
+        value = _read_dotenv(_REPO_ROOT / ".env").get(RUNTIME_CONFIG_ENV, "")
+    return value or ""
+
+
+def _read_yaml(path: Any) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path} must contain a mapping")
+    return raw
+
+
+def _overlay_keys(raw: dict) -> dict:
+    """Keep only the whitelisted sections and keys. Nothing else is ever
+    written to the runtime file or to the audit log, so no secret can leak."""
+    kept: dict[str, dict] = {}
+    for section, keys in OVERLAY_KEYS.items():
+        values = raw.get(section)
+        if isinstance(values, dict):
+            picked = {k: values[k] for k in keys if k in values}
+            if picked:
+                kept[section] = picked
+    return kept
+
+
+def _load_settings() -> dict:
+    """Effective settings: defaults, then config/firewall.yaml, then the runtime file.
+
+    A source that cannot be read, or whose values are invalid, is skipped (and
+    logged), the same way the gateway keeps its last good configuration.
+    """
+    settings = copy.deepcopy(DEFAULT_SETTINGS)
+    sources = [("packaged config", PACKAGED_CONFIG_PATH)]
+    runtime = _runtime_config_path()
+    if runtime and os.path.exists(runtime):
+        sources.append(("runtime config", runtime))
+    for label, path in sources:
+        try:
+            overlay = _overlay_keys(_read_yaml(path))
+        except (OSError, ValueError, yaml.YAMLError):
+            logger.warning("Could not read the %s (%s); skipping it", label, path, exc_info=True)
+            continue
+        candidate = copy.deepcopy(settings)
+        for section, values in overlay.items():
+            candidate[section].update(values)
+        problems = validate_settings(candidate)
+        if problems:
+            logger.warning("Ignoring the %s (%s): %s", label, path, " ".join(problems))
+            continue
+        settings = candidate
+    return settings
+
+
+def _write_runtime_file(path: str, settings: dict) -> None:
+    """Write the file atomically: temp file in the same folder, then rename."""
+    target = Path(path)
+    text = (
+        "# Written by the dashboard. The gateway reads only these keys.\n"
+        + yaml.safe_dump(settings, sort_keys=True, default_flow_style=False)
+    )
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=target.parent,
+            prefix=".firewall-", suffix=".tmp", delete=False,
+        ) as tmp:
+            tmp_name = tmp.name
+            tmp.write(text)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.chmod(tmp_name, 0o644)      # the gateway may run as another user and must be able to read it
+        os.replace(tmp_name, target)   # atomic; os.replace also works on Windows
+    except Exception:
+        if tmp_name and os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        raise
+
+
+def _save_settings(settings: dict, admin_user: str) -> None:
+    _require_admin_user(admin_user)
+    new = _overlay_keys(settings)
+    errors = validate_settings(new)
+    if errors:
+        raise ValueError(" ".join(errors))
+
+    path = _runtime_config_path()
+    if not path:
+        raise RuntimeError(f"{RUNTIME_CONFIG_ENV} is not set, so settings cannot be saved.")
+    old = _overlay_keys(_load_settings())
+
+    _write_runtime_file(path, new)  # 1. the file first: if this raises, there is no audit row
+    try:
+        run_sync(write_audit_log(   # 2. the audit row only after the write succeeded
+            admin_user=admin_user,
+            action="THRESHOLD_CHANGED",
+            before=old,
+            after=new,
+        ))
+    except Exception as exc:
+        raise RuntimeError(
+            "The settings file was updated, but the audit row could not be written: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+async def _fetch_last_settings_change() -> dict | None:
+    from sqlalchemy import select
+
+    from src.database.models import AdminAuditLog
+    from src.database.storage import AsyncSessionLocal
+
+    stmt = (
+        select(AdminAuditLog)
+        .where(AdminAuditLog.action == "THRESHOLD_CHANGED")
+        .order_by(AdminAuditLog.timestamp.desc())
+        .limit(1)
+    )
+    async with AsyncSessionLocal() as session:
+        row = (await session.execute(stmt)).scalar_one_or_none()
+    if row is None:
+        return None
+    return {"when": row.timestamp, "admin": row.admin_user}
+
+
+def _last_settings_change() -> dict | None:
+    """When the settings were last changed and by whom, from the latest audit row."""
+    return run_sync(_fetch_last_settings_change())
+
+
+# --------------------------------------------------------------- UI helpers
 def _store(key: str, default_factory: Callable[[], Any]) -> Any:
     if key not in st.session_state:
         st.session_state[key] = default_factory()
     return st.session_state[key]
 
 
-def _require_admin_user(admin_user: str) -> None:
-    if not admin_user:
-        raise PermissionError("Sign in as an admin to make changes.")
-
-
-def _audit(admin_user: str, action: str, detail: str) -> None:
-    # TODO(P3, Wed): the real audit row is written by storage.write_audit_log in the same transaction.
-    _store("_cfg_audit", list).append(
-        (datetime.now().strftime("%H:%M:%S"), admin_user, action, detail)
-    )
-
-
-def _load_rules(category: str | None = None, rule_type: str | None = None) -> list[dict]:
-    # TODO(P3, Wed): wire to DB (storage.list_rules)
-    rules = _store("_cfg_rules", _seed_rules)
-    return [
-        copy.deepcopy(r) for r in rules
-        if (category is None or r["category"] == category)
-        and (rule_type is None or r["rule_type"] == rule_type)
-    ]
-
-
-def _create_rule(rule: dict, admin_user: str) -> dict:
-    # TODO(P3, Wed): wire to DB (storage.create_rule)
-    _require_admin_user(admin_user)
-    rules = _store("_cfg_rules", _seed_rules)
-    errors = validate_rule(rule, [r["rule_id"] for r in rules], is_new=True)
-    if errors:
-        raise ValueError(" ".join(errors))
-    created = {"rule_id": str(rule["rule_id"]).strip(), **{k: rule[k] for k in EDITABLE_FIELDS if k in rule}}
-    created.setdefault("description", "")
-    created.setdefault("is_active", True)
-    rules.append(created)
-    _audit(admin_user, "CREATE_RULE", created["rule_id"])
-    return copy.deepcopy(created)
-
-
-def _update_rule(rule_id: str, changes: dict, admin_user: str) -> dict:
-    # TODO(P3, Wed): wire to DB (storage.update_rule)
-    _require_admin_user(admin_user)
-    rules = _store("_cfg_rules", _seed_rules)
-    rule = next((r for r in rules if r["rule_id"] == rule_id), None)
-    if rule is None:
-        raise ValueError(f"Rule {rule_id} was not found.")
-    allowed = {k: v for k, v in changes.items() if k in EDITABLE_FIELDS}
-    errors = validate_rule({**rule, **allowed}, is_new=False)
-    if errors:
-        raise ValueError(" ".join(errors))
-    rule.update(allowed)
-    _audit(admin_user, "UPDATE_RULE", f"{rule_id}: {', '.join(sorted(allowed))}")
-    return copy.deepcopy(rule)
-
-
-def _delete_rule(rule_id: str, admin_user: str) -> None:
-    # TODO(P3, Wed): wire to DB (storage.delete_rule)
-    _require_admin_user(admin_user)
-    rules = _store("_cfg_rules", _seed_rules)
-    for index, rule in enumerate(rules):
-        if rule["rule_id"] == rule_id:
-            del rules[index]
-            _audit(admin_user, "DELETE_RULE", rule_id)
-            return
-    raise ValueError(f"Rule {rule_id} was not found.")
-
-
-def _load_settings() -> dict:
-    # TODO(P3, Wed): wire to runtime config (the runtime copy of firewall.yaml)
-    return copy.deepcopy(_store("_cfg_settings", lambda: copy.deepcopy(DEFAULT_SETTINGS)))
-
-
-def _save_settings(settings: dict, admin_user: str) -> None:
-    # TODO(P3, Wed): wire to runtime config (write the overlay keys, then write_audit_log)
-    _require_admin_user(admin_user)
-    errors = validate_settings(settings)
-    if errors:
-        raise ValueError(" ".join(errors))
-    old = _load_settings()
-    st.session_state["_cfg_settings"] = copy.deepcopy(settings)
-    _audit(admin_user, "UPDATE_SETTINGS", "; ".join(_describe_changes(old, settings)) or "no changes")
-
-
-# --------------------------------------------------------------- UI helpers
 def _flash(level: str, text: str) -> None:
     _store("_cfg_flash", list).append((level, text))
 
@@ -398,7 +490,7 @@ def _bump_epoch() -> None:
 
 
 def _attempt(action: str, func: Callable[..., Any], *args: Any) -> tuple[bool, str]:
-    """Run a seam function. Never raises: returns (ok, error text)."""
+    """Run a data function. Never raises: returns (ok, error text)."""
     try:
         func(*args)
         return True, ""
@@ -429,7 +521,7 @@ def _rules_table(rules: list[dict]) -> None:
                 "Severity": r["severity"],
                 "Active": "Yes" if r["is_active"] else "No",
                 "Pattern": r["pattern"] if len(r["pattern"]) <= 80 else r["pattern"][:77] + "...",
-                "Description": r["description"],
+                                "Description": r["description"] or "",
             }
             for r in rules
         ],
@@ -443,6 +535,21 @@ def _discard_setting_edits() -> None:
         del st.session_state[key]
 
 
+def _show_last_change() -> None:
+    try:
+        last = _last_settings_change()
+    except Exception:
+        logger.warning("Could not read the latest settings audit row", exc_info=True)
+        st.caption("Time of the last settings change is unavailable right now.")
+        return
+    if last is None:
+        st.caption("No settings change has been recorded yet.")
+        return
+    when = last["when"]
+    stamp = when.strftime("%Y-%m-%d %H:%M:%S %Z").strip() if hasattr(when, "strftime") else str(when)
+    st.caption(f"Settings last changed {stamp} by {last['admin']}.")
+
+
 def render_layers_tab(admin: str) -> None:
     can_edit = bool(admin)
     try:
@@ -450,6 +557,12 @@ def render_layers_tab(admin: str) -> None:
     except Exception as exc:
         st.error(f"Could not load the settings: {type(exc).__name__}: {exc}")
         return
+
+    runtime_path = _runtime_config_path()
+    if not runtime_path:
+        st.warning(f"{RUNTIME_CONFIG_ENV} is not set, so settings cannot be saved.")
+    st.caption("The values below are the current effective settings.")
+    _show_last_change()
 
     st.subheader("Protection layers")
     pipeline = {
@@ -499,7 +612,7 @@ def render_layers_tab(admin: str) -> None:
         )
 
     changes = _describe_changes(saved, new)
-    blocked = (not can_edit) or bool(errors) or not confirmed
+    blocked = (not can_edit) or bool(errors) or not confirmed or not runtime_path
     save_col, discard_col = st.columns([1, 1])
     with save_col:
         save_pressed = st.button("Save settings", type="primary", disabled=blocked, key="cfg_set_save")
@@ -529,7 +642,7 @@ def _rule_fields(prefix: str, defaults: dict, lock_id: bool) -> dict:
         "severity": st.selectbox("Severity", SEVERITIES, index=_index(SEVERITIES, defaults.get("severity"), 2), key=f"{prefix}_sev"),
         "pattern": st.text_area("Pattern", value=str(defaults.get("pattern", "")), key=f"{prefix}_pat",
                                 help=f"Up to {MAX_PATTERN_LENGTH} characters. A REGEX pattern must compile."),
-        "description": st.text_input("Description", value=str(defaults.get("description", "")), key=f"{prefix}_desc"),
+                "description": st.text_input("Description", value=str(defaults.get("description") or ""), key=f"{prefix}_desc"),
         "is_active": st.checkbox("Active", value=bool(defaults.get("is_active", True)), key=f"{prefix}_act"),
     }
 
@@ -588,7 +701,11 @@ def render_rules_tab(admin: str) -> None:
             values = _rule_fields(f"cfg_edit_{rule_id}_{epoch}", rule, True)
             submitted = st.form_submit_button("Save changes")
         if submitted:
-            changes = {k: values[k] for k in EDITABLE_FIELDS if values[k] != rule[k]}
+            changes = {
+                k: values[k] for k in EDITABLE_FIELDS
+                if (values[k] or None) != (rule[k] or None)
+                if k == "description" or values[k] != rule[k]
+            }
             if not changes:
                 st.info("Nothing to save: the rule is unchanged.")
             else:
@@ -710,10 +827,6 @@ def main() -> None:
 
     st.title("Configuration")
     st.caption("Protection layers, Layer 2 thresholds, detection rules and the keyword deny list.")
-    st.info(
-        "Temporary data: changes are kept in this browser session only and do not reach the "
-        "firewall yet. They are connected to the database and the runtime config on Wednesday."
-    )
 
     admin = require_admin()
     if _admin_password() and not admin:
@@ -727,14 +840,6 @@ def main() -> None:
         _draw_tab(render_rules_tab, admin, "rules")
     with deny_tab:
         _draw_tab(render_deny_list_tab, admin, "deny list")
-
-    audit = st.session_state.get("_cfg_audit", [])
-    if audit:
-        with st.expander(f"Changes made in this session ({len(audit)})"):
-            st.dataframe(
-                [{"Time": t, "Admin": a, "Action": act, "Detail": d} for t, a, act, d in reversed(audit)],
-                hide_index=True,
-            )
 
 
 if __name__ == "__main__":
