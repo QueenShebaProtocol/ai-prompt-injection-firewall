@@ -23,7 +23,7 @@ from src.engine import layer_3_evaluator as l3
 
 ROOT = Path(__file__).resolve().parents[1]
 
-P3_MERGED = False
+P3_MERGED = True
 
 needs_p3 = pytest.mark.xfail(
     not P3_MERGED,
