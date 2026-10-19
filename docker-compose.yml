@@ -1,38 +1,43 @@
-# ---------------------------------------------------------------------
-# Week 1 scope: database + firewall gateway (proxy + Layer 1) only.
-# The Streamlit dashboard service is added in Week 3.
-#
-# No file is mounted into /docker-entrypoint-initdb.d/ — the schema is
-# created by the gateway itself at startup via init_schema()
-# (see src/database/connection.py), since this project has no sql/ folder.
-# ---------------------------------------------------------------------
+# AI Prompt Injection Firewall: database, gateway, and dashboard.
+# Host exposure:
+#   - PROXY_PORT (default 8000): published on all host interfaces; restrict with your firewall.
+#   - Dashboard 8501: localhost-only by default. Change 127.0.0.1 to 0.0.0.0 only
+#     when remote access is intentional and protected by network controls/TLS.
+#   - PostgreSQL: not published to the host; reachable only on the private Compose network.
+
 services:
   db:
     image: postgres:16-alpine
     container_name: firewall_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    ports:
-      - "127.0.0.1:5432:5432"   # bound to localhost only — never expose this publicly
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+    # No host port: the database is private to the Compose network.
     volumes:
       - firewall_pgdata:/var/lib/postgresql/data
+    networks:
+      - firewall_private
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 5s
 
   gateway:
     build:
       context: .
       dockerfile: Dockerfile
+    image: ai-prompt-injection-firewall:local
     container_name: firewall_gateway
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      FIREWALL_RUNTIME_CONFIG_PATH: /app/runtime/firewall.yaml
     depends_on:
       db:
         condition: service_healthy
@@ -40,6 +45,87 @@ services:
       - "${PROXY_PORT:-8000}:8000"
     volumes:
       - ./config:/app/config:ro
+      - firewall_runtime:/app/runtime:ro
+    networks:
+      - firewall_private
+    # Seed the runtime overlay only on first boot; preserve it across restarts.
+    # The Dockerfile must create /app/runtime owned by UID 10001 before USER firewall.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        if [ ! -f /app/runtime/firewall.yaml ]; then
+          cp /app/config/firewall.yaml /app/runtime/firewall.yaml;
+        fi;
+        exec "$@"
+      - --
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+
+  dashboard:
+    image: ai-prompt-injection-firewall:local
+    container_name: firewall_dashboard
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      DASHBOARD_ADMIN_PASSWORD: ${DASHBOARD_ADMIN_PASSWORD:?Set DASHBOARD_ADMIN_PASSWORD in .env}
+      FIREWALL_RUNTIME_CONFIG_PATH: /app/runtime/firewall.yaml
+    command: ["streamlit", "run", "src/dashboard/app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
+    depends_on:
+      db:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - ./config:/app/config:ro
+      - firewall_runtime:/app/runtime:rw
+    networks:
+      - firewall_private
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        if [ ! -f /app/runtime/firewall.yaml ]; then
+          cp /app/config/firewall.yaml /app/runtime/firewall.yaml;
+        fi;
+        exec "$@"
+      - --
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=2)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  seed:
+    image: ai-prompt-injection-firewall:local
+    restart: "no"
+    profiles: ["setup"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    command: ["python", "-m", "scripts.seed_rules"]
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./config:/app/config:ro
+    networks:
+      - firewall_private
 
 volumes:
   firewall_pgdata:
+  firewall_runtime:
+
+networks:
+  firewall_private:
+    driver: bridge
