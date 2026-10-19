@@ -40,7 +40,7 @@ from typing import Any, Mapping
 from sqlalchemy import and_, func, literal_column, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from src.database.connection import AsyncSessionLocal
 from src.database.models import (
     AdminAuditLog,
