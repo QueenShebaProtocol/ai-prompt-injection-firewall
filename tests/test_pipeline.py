@@ -192,7 +192,8 @@ def test_threshold_boundaries(l1_rules, fake_clf, score, l2_decision, final, blo
     assert r.layer2_score == score
     assert r.risk_score == score
     assert r.action_taken == ("BLOCKED" if blocked else "PASSED")
-    assert r.triggered_layer == ("LAYER_2" if blocked else "NONE")
+    expected_layer = "LAYER_2" if blocked else ("LAYER_3" if l2_decision == "ESCALATE" else "NONE")
+    assert r.triggered_layer == expected_layer
     if l2_decision == "ESCALATE":
         assert r.layer_details["layer_3"]["status"] == "ok"
         assert r.layer_details["layer_3"]["decision"] == "ALLOW"
