@@ -143,8 +143,9 @@ async def call_local_model(
     Sends an asynchronous HTTP POST request using a shared httpx.AsyncClient.
     Reads LAYER3_BASE_URL and LAYER3_MODEL from environment variables.
     """
-    base_url = os.getenv("LAYER3_BASE_URL", "http://localhost:11434/v1").rstrip("/")
-    model_name = os.getenv("LAYER3_MODEL", "qwen2.5:7b-instruct")
+    base_url = os.getenv("LAYER3_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+    model_name = os.getenv("LAYER3_MODEL", "openai/gpt-oss-120b")
+    api_key = os.getenv("LAYER3_API_KEY") or os.getenv("LLM_API_KEY", "")
 
     endpoint = f"{base_url}/chat/completions"
     payload = {
@@ -154,8 +155,9 @@ async def call_local_model(
         "max_tokens": max_tokens,
     }
 
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     client = await get_http_client()
-    response = await client.post(endpoint, json=payload, timeout=timeout_seconds)
+    response = await client.post(endpoint, json=payload, headers=headers, timeout=timeout_seconds)
     response.raise_for_status()
     data = response.json()
 

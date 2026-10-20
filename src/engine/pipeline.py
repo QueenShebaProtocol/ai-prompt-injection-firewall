@@ -439,7 +439,7 @@ async def _escalate_to_layer3(
 
     return PipelineResult(                        # ALLOW
         request_id=request_id, is_blocked=False, action_taken="PASSED",
-        triggered_layer="NONE", risk_score=score, layer2_score=score,
+        triggered_layer="LAYER_3", risk_score=score, layer2_score=score,
         execution_time_ms=_ms_since(start), layer_details=layer_details,
         decision="PASS",
     )
