@@ -56,7 +56,10 @@ RUN set -eu; \
 RUN chmod -R a+rX /app \
     && groupadd --gid 10001 firewall \
     && useradd --uid 10001 --gid firewall --no-create-home \
-               --shell /usr/sbin/nologin firewall
+               --shell /usr/sbin/nologin firewall \
+    && mkdir -p /app/runtime \
+    && cp /app/config/firewall.yaml /app/runtime/firewall.yaml \
+    && chown -R 10001:10001 /app/runtime
 USER firewall
 
 EXPOSE 8000
