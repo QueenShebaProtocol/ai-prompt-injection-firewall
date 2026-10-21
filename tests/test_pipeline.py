@@ -472,43 +472,128 @@ def test_set_pipeline_config_is_returned_by_getter():
 
 
 # ======================================================================
-# 8. Placeholders: Layer 3 / output-scanner cascade (P6 adds on Friday)
+# 8. Layer 3 and output-scanner cascade
 # ======================================================================
-@pytest.mark.skip(reason="P6 adds Friday: Layer 3 integration")
-def test_escalate_calls_layer3_and_allows():
-    ...
+from src.engine.output_scanner import Span
+
+AMBIGUOUS_SCORE = 0.5   # between the low (0.30) and high (0.85) thresholds, so Layer 2 escalates
 
 
-@pytest.mark.skip(reason="P6 adds Friday: Layer 3 integration")
-def test_escalate_calls_layer3_and_blocks():
-    ...
+@pytest.fixture
+def l3_answer(monkeypatch):
+    """Make Layer 3 return a chosen answer. Returns the list of prompts it received."""
+    def _install(decision="ALLOW", sanitized_prompt=None, degraded=False):
+        calls = []
+
+        async def _fake(prompt, system_instruction="", context=None):
+            calls.append(prompt)
+            return Layer3Result(decision=decision, rationale="test",
+                                sanitized_prompt=sanitized_prompt,
+                                latency_ms=1.0, degraded=degraded)
+        monkeypatch.setattr(pipeline, "evaluate_layer3", _fake)
+        return calls
+    return _install
 
 
-@pytest.mark.skip(reason="P6 adds Friday: Layer 3 integration")
-def test_escalate_calls_layer3_and_redacts():
-    ...
+@pytest.fixture
+def fake_detectors(monkeypatch):
+    """Replace the two output detectors. Returns a list recording each call."""
+    def _install(leak=(), pii=()):
+        calls = []
+
+        def _leak(text, system_instruction):
+            calls.append("leak")
+            return list(leak)
+
+        async def _pii(text):
+            calls.append("pii")
+            return list(pii)
+        monkeypatch.setattr(pipeline, "detect_system_prompt_leak", _leak)
+        monkeypatch.setattr(pipeline, "detect_pii", _pii)
+        return calls
+    return _install
 
 
-@pytest.mark.skip(reason="P6 adds Friday: Layer 3 only runs in the ambiguous band")
-def test_layer3_not_called_outside_ambiguous_band():
-    ...
+def scan_it(text="some completion"):
+    return asyncio.run(pipeline.scan_output(text, "", "req-test"))
 
 
-@pytest.mark.skip(reason="P6 adds Friday: Layer 3 failure policy")
-def test_layer3_failure_follows_on_failure_setting():
-    ...
+def test_escalate_calls_layer3_and_allows(l1_rules, fake_clf, l3_answer):
+    fake_clf(score=AMBIGUOUS_SCORE)
+    calls = l3_answer("ALLOW")
+    result = run_it(BENIGN_PROMPT)
+    assert calls == [BENIGN_PROMPT]
+    assert result.is_blocked is False
+    assert result.decision == "PASS"
+    assert result.triggered_layer == "LAYER_3"
+    assert result.layer_details["layer_3"]["decision"] == "ALLOW"
 
 
-@pytest.mark.skip(reason="P6 adds Friday: Layer 3 disabled flag")
-def test_layer3_disabled_in_config_skips_layer3():
-    ...
+def test_escalate_calls_layer3_and_blocks(l1_rules, fake_clf, l3_answer):
+    fake_clf(score=AMBIGUOUS_SCORE)
+    calls = l3_answer("BLOCK")
+    result = run_it(BENIGN_PROMPT)
+    assert len(calls) == 1
+    assert result.is_blocked is True
+    assert result.action_taken == "BLOCKED"
+    assert result.decision == "BLOCK"
+    assert result.triggered_layer == "LAYER_3"
 
 
-@pytest.mark.skip(reason="P6 adds Friday: output scanner cascade")
-def test_output_scanner_redacts_completion():
-    ...
+def test_escalate_calls_layer3_and_redacts(l1_rules, fake_clf, l3_answer):
+    fake_clf(score=AMBIGUOUS_SCORE)
+    l3_answer("REDACT", sanitized_prompt="Summarise [REDACTED]")
+    result = run_it(BENIGN_PROMPT)
+    assert result.is_blocked is False
+    assert result.action_taken == "REDACTED"
+    assert result.decision == "REDACT"
+    assert result.sanitized_prompt == "Summarise [REDACTED]"
 
 
-@pytest.mark.skip(reason="P6 adds Friday: output scanner cascade")
-def test_output_scanner_disabled_in_config_skips_scan():
-    ...
+@pytest.mark.parametrize("score", [0.05, 0.95])
+def test_layer3_not_called_outside_ambiguous_band(l1_rules, fake_clf, l3_answer, score):
+    fake_clf(score=score)
+    calls = l3_answer("ALLOW")
+    run_it(BENIGN_PROMPT)
+    assert calls == []
+
+
+@pytest.mark.parametrize("fallback, blocked", [("BLOCK", True), ("ALLOW", False)])
+def test_layer3_degraded_fallback_decision_is_applied(
+        l1_rules, fake_clf, l3_answer, fallback, blocked):
+    fake_clf(score=AMBIGUOUS_SCORE)
+    l3_answer(fallback, degraded=True)
+    result = run_it(BENIGN_PROMPT)
+    assert result.is_blocked is blocked
+    assert result.layer_details["layer_3"]["status"] == "degraded"
+    assert result.layer_details["layer_3"]["degraded"] is True
+
+
+def test_layer3_disabled_in_config_skips_layer3(l1_rules, fake_clf, l3_answer, use_config):
+    use_config(PipelineConfig(layer_3_enabled=False))
+    fake_clf(score=AMBIGUOUS_SCORE)
+    calls = l3_answer("BLOCK")
+    result = run_it(BENIGN_PROMPT)
+    assert calls == []
+    assert result.layer_details["layer_3"] == {"status": "disabled"}
+    assert result.is_blocked is False
+    assert result.decision == "PASS"
+
+
+def test_output_scanner_reports_redact_action_with_spans(use_config, fake_detectors):
+    use_config(PipelineConfig(output_on_detect="redact"))
+    fake_detectors(pii=[Span(start=0, end=5, category="SECRET_LEAK")])
+    result = scan_it()
+    assert result.flagged is True
+    assert result.action == "REDACT"
+    assert result.categories == ["SECRET_LEAK"]
+    assert len(result.spans) == 1
+
+
+def test_output_scanner_disabled_in_config_skips_scan(use_config, fake_detectors):
+    use_config(PipelineConfig(output_scanner_enabled=False))
+    calls = fake_detectors(pii=[Span(start=0, end=5, category="PII_LEAK")])
+    result = scan_it()
+    assert calls == []
+    assert result.flagged is False
+    assert result.action == "PASS"
