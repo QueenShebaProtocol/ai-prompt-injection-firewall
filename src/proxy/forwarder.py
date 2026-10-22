@@ -33,7 +33,7 @@ import httpx
 # request URL below never produces a double slash, regardless of how the
 # operator wrote it in .env.
 TARGET_LLM_BASE_URL: str = os.environ.get(
-    "TARGET_LLM_BASE_URL", "https://api.openai.com/v1"
+    "TARGET_LLM_BASE_URL", "https://api.groq.com/openai/v1"
 ).rstrip("/")
 TARGET_LLM_API_KEY: str = os.environ.get("TARGET_LLM_API_KEY", "")
 DOWNSTREAM_TIMEOUT_SECONDS: float = float(
