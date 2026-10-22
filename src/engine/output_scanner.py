@@ -16,9 +16,9 @@ from typing import Any, Mapping, Sequence
 logger = logging.getLogger("firewall.output_scanner")
 
 # Rule-ID convention agreed for this implementation:
-# IDs beginning with SECRET_ or SECRET- produce SECRET_LEAK spans.
+# IDs beginning with SECRET_, SECRET-, RULE_PII_SECRET_ or RULE_PII_SECRET- produce SECRET_LEAK spans.
 # Other rules loaded from the PII category produce PII_LEAK spans.
-_SECRET_RULE_PREFIXES = ("SECRET_", "SECRET-")
+_SECRET_RULE_PREFIXES = ("SECRET_", "SECRET-", "RULE_PII_SECRET_", "RULE_PII_SECRET-")
 
 # Accepted field names allow the scanner to work with dictionaries or
 # ORM-like rule objects. Align these with the actual P5 rule model.
@@ -468,7 +468,7 @@ def _candidate_digits(match_text: str) -> str:
 async def detect_pii(text: str) -> list[Span]:
     """Detect PII and secrets using active PII-category regex rules.
 
-    Rule IDs starting with SECRET_ or SECRET- are tagged SECRET_LEAK.
+    Rule IDs starting with SECRET_, SECRET-, RULE_PII_SECRET_ or RULE_PII_SECRET- are tagged SECRET_LEAK.
     Other rules are tagged PII_LEAK.
 
     For rules whose ID contains CARD (case-insensitive), the match must:
