@@ -97,7 +97,7 @@ OUTPUT_LEAKS = ["PII_LEAK", "SECRET_LEAK", "SYSTEM_PROMPT_LEAK"]
 # 88% PASSED, 2% REDACTED, 10% BLOCKED; 3% of rows have output_flagged.
 KINDS = {
     "pass_l2":      (0.81, "PASSED",   "NONE",           False, False),
-    "pass_l3":      (0.06, "PASSED",   "NONE",           False, False),
+    "pass_l3":      (0.06, "PASSED",   "LAYER_3",        False, False),
     "pass_flagged": (0.01, "PASSED",   "NONE",           False, True),   # scanner in warn mode
     "redact_l3":    (0.01, "REDACTED", "LAYER_3",        False, False),
     "redact_out":   (0.01, "REDACTED", "OUTPUT_SCANNER", False, True),

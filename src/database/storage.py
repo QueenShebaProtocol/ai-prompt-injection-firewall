@@ -88,13 +88,11 @@ async def write_threat_log(entry: dict) -> None:
 # =============================================================================
 
 
-async def get_active_layer1_rules() -> list[FirewallRule]:
-    """Return all active Layer 1 firewall rules.
+async def get_active_layer1_rules() -> list[dict]:
+    """Return all active Layer 1 firewall rules as plain dicts.
 
-    Layer 1 uses REGEX, KEYWORD and EXCLUSION rules.
-
-    The rules are loaded from PostgreSQL so that the firewall can support
-    dynamic rule updates without requiring a source-code change.
+    Returns dicts (not ORM objects) matching the shared rule shape:
+      {rule_id, rule_type, category, pattern, description, severity}
     """
     async with AsyncSessionLocal() as session:
         stmt = (
@@ -109,8 +107,19 @@ async def get_active_layer1_rules() -> list[FirewallRule]:
         )
 
         result = await session.execute(stmt)
+        rows = result.scalars().all()
 
-        return list(result.scalars().all())
+        return [
+            {
+                "rule_id":     r.rule_id,
+                "rule_type":   r.rule_type,
+                "category":    r.category,
+                "pattern":     r.pattern,
+                "description": r.description,
+                "severity":    r.severity,
+            }
+            for r in rows
+        ]
 
 
 async def get_rules_fingerprint() -> str:
@@ -129,12 +138,11 @@ async def get_rules_fingerprint() -> str:
     canonical = "\n".join(
         "|".join(
             [
-                str(rule.rule_id or ""),
-                str(rule.rule_type or ""),
-                str(rule.category or ""),
-                str(rule.pattern or ""),
-                str(rule.severity or ""),
-                str(rule.is_active),
+                str(rule.get("rule_id") or ""),
+                str(rule.get("rule_type") or ""),
+                str(rule.get("category") or ""),
+                str(rule.get("pattern") or ""),
+                str(rule.get("severity") or ""),
             ]
         )
         for rule in rules

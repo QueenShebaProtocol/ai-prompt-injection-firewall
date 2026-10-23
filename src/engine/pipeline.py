@@ -459,7 +459,7 @@ async def run_pipeline(
     # ---------------- Layer 1 ----------------
     if cfg.layer_1_enabled:
         l1_start = time.perf_counter()
-        l1 = layer1_engine.evaluate(prompt, system_instruction)
+        l1 = layer1_engine.evaluate(prompt)  # system prompt is trusted; scan user prompt only
         layer_details["layer_1"] = {
             "matched": l1.matched,
             "rule_id": l1.rule_id,

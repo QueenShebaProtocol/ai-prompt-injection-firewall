@@ -124,7 +124,7 @@ def render_log_table(page: Page) -> str | None:
         "action_taken": _action_label(r.get("action_taken")),
         "triggered_layer": r.get("triggered_layer"),
         "risk_score": r.get("risk_score"),
-        "prompt_preview": _preview(r.get("raw_prompt")),
+        "prompt_preview": _preview(r.get("raw_prompt") or r.get("prompt_preview")),
     } for r in rows])
 
     options: dict[str, Any] = dict(
