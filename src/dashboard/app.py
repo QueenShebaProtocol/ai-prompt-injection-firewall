@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from src.database.storage import run_sync, get_kpi_summary
 
 logger = logging.getLogger(__name__)
 
@@ -139,15 +140,9 @@ def database_is_available() -> bool:
             sys.path.insert(0, str(ROOT))
 
         from src.database.connection import check_database_connection
+        from src.database.storage import run_sync
 
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return bool(asyncio.run(check_database_connection()))
-
-        # Streamlit normally has no running event loop. If one exists,
-        # avoid nested-loop errors and report an unknown/unreachable state.
-        return False
+        return bool(run_sync(check_database_connection()))
     except Exception:
         logger.warning("Dashboard database health check failed.", exc_info=True)
         return False
@@ -220,20 +215,41 @@ with header_right:
 
 st.markdown("---")
 
-# Empty-state metrics: don't present invented numbers as real telemetry.
-st.markdown("### Security Metrics")
-st.caption(
-    "Live metrics will appear here when dashboard analytics are connected "
-    "to stored firewall events."
-)
+# Fetch live metrics if the database is connected
+kpis = None
+if settings["database_available"]:
+    try:
+        kpis = run_sync(get_kpi_summary(hours=24))
+    except Exception as e:
+        logger.warning(f"Failed to load home page KPIs: {e}")
+
+if kpis:
+    total = f"{kpis.get('total_requests', 0):,}"
+    blocked = f"{kpis.get('blocked_requests', 0):,}"
+    safe = f"{max(0, kpis.get('total_requests', 0) - kpis.get('blocked_requests', 0)):,}"
+    rate = f"{kpis.get('block_rate', 0.0) * 100:.1f}%"
+    
+    st.markdown("### Security Metrics")
+    st.caption("Live metrics over the last 24 hours.")
+    
+    metric_specs = [
+        ("TOTAL REQUESTS", total, "Last 24 hours", BLUE),
+        ("SAFE PROMPTS", safe, "Passed inspection", GREEN),
+        ("BLOCKED THREATS", blocked, "Blocked by firewall", RED),
+        ("THREAT RATE", rate, "Block percentage", GOLD),
+    ]
+else:
+    # Fallback empty state
+    st.markdown("### Security Metrics")
+    st.caption("Live metrics will appear here when dashboard analytics are connected to stored firewall events.")
+    metric_specs = [
+        ("TOTAL REQUESTS", "—", "Awaiting telemetry", BLUE),
+        ("SAFE PROMPTS", "—", "Awaiting telemetry", GREEN),
+        ("BLOCKED THREATS", "—", "Awaiting telemetry", RED),
+        ("THREAT RATE", "—", "Awaiting telemetry", GOLD),
+    ]
 
 metric_columns = st.columns(4)
-metric_specs = [
-    ("TOTAL REQUESTS", "—", "Awaiting telemetry", BLUE),
-    ("SAFE PROMPTS", "—", "Awaiting telemetry", GREEN),
-    ("BLOCKED THREATS", "—", "Awaiting telemetry", RED),
-    ("THREAT RATE", "—", "Awaiting telemetry", GOLD),
-]
 for column, (label, value, note, accent) in zip(metric_columns, metric_specs):
     with column:
         st.markdown(
