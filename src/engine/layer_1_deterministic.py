@@ -98,7 +98,17 @@ class Layer1Engine:
         # Fingerprint first: if a rule changes between the two queries,
         # the next poll sees a newer fingerprint and reloads (never misses).
         fingerprint = await get_rules_fingerprint()
-        rules = await get_active_layer1_rules()
+        database_rules = await get_active_layer1_rules()
+        rules = [
+            {
+                "rule_id": rule.rule_id,
+                "rule_type": rule.rule_type,
+                "category": rule.category,
+                "pattern": rule.pattern,
+                "severity": rule.severity,
+            }
+            for rule in database_rules
+        ]
         self.set_rules(rules)
         self._fingerprint = fingerprint
         logger.info("Layer 1: %d rules active", self.rule_count)
