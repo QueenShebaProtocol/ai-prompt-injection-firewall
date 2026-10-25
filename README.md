@@ -7,6 +7,16 @@ attacks and data leaks. Each organization runs its own copy inside its own netwo
 prompts, responses and threat logs never leave your security boundary, and the
 inspection models run locally.
 
+### Key Features
+- **Hybrid Threat Detection:** Combines rule-based detection, machine learning, and AI-assisted analysis.
+- **Input Protection:** Identifies potentially malicious prompts and instruction manipulation attempts.
+- **Output Security:** Detects potential exposure of sensitive information, including personal data and API keys.
+- **Threat Management:** Allows, blocks, or flags suspicious requests and responses according to security policies.
+- **Monitoring Dashboard:** Provides threat logs, security event monitoring, and detection insights.
+- **Containerized Deployment:** Uses Docker for deployment and supports integration with AI services through APIs.
+
+**Purpose:** To improve AI application security, reduce the risk of prompt injection, and help protect sensitive information.
+
 <div align="center">
 
 ### 🎥 Watch the full AI Firewall walkthrough in Amharic
