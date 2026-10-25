@@ -20,6 +20,19 @@ inspection models run locally.
                               │ PostgreSQL (local) │───────▶│ Streamlit dashboard│
                               └────────────────────┘        └────────────────────┘
 ```
+## Team
+
+| # | Name | ID |
+|---|------|----|
+| 1 | Awel Abduljelil | CTC-1256-26 |
+| 2 | Biruktawit Masresha | CTC-483-26 |
+| 3 | Sirajudin Seid |CTC-153-26 |
+| 4 | Tsegazeab Fikre | CTC-229-26 |
+| 5 | Gelila Fassil | CTC-3817-26 |
+| 6 | Tirsit Bizualem | CTC-288-26 |
+| 7 | Hana Tamirat | CTC-3776-26 |
+
+
 
 Your application keeps using its normal LLM SDK; only the base URL changes (see
 [Point your application at the firewall](#point-your-application-at-the-firewall)).
