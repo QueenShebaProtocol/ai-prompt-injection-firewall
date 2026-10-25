@@ -32,7 +32,8 @@ inspection models run locally.
 | 6 | Tirsit Bizualem | CTC-288-26 |
 | 7 | Hana Tamirat | CTC-3776-26 |
 
-
+**Watch full AI firewall detail in amharic language **
+[video link](https://drive.google.com/file/d/1nMH3Kq8i9nlyw5a1onydTl51O4j66lZp/view?usp=drive_link)
 
 Your application keeps using its normal LLM SDK; only the base URL changes (see
 [Point your application at the firewall](#point-your-application-at-the-firewall)).
