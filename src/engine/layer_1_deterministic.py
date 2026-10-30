@@ -101,11 +101,11 @@ class Layer1Engine:
         database_rules = await get_active_layer1_rules()
         rules = [
             {
-                "rule_id": rule.rule_id,
-                "rule_type": rule.rule_type,
-                "category": rule.category,
-                "pattern": rule.pattern,
-                "severity": rule.severity,
+                "rule_id": rule["rule_id"],
+                "rule_type": rule["rule_type"],
+                "category": rule["category"],
+                "pattern": rule["pattern"],
+                "severity": rule["severity"],
             }
             for rule in database_rules
         ]
