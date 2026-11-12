@@ -16,7 +16,28 @@ inspection models run locally.
 - **Containerized Deployment:** Uses Docker for deployment and supports integration with AI services through APIs.
 
 **Purpose:** To improve AI application security, reduce the risk of prompt injection, and help protect sensitive information.
+## Team
 
+<div align="center">
+
+**Built with ❤️ by the team as our final project**
+
+</div>
+
+| # | Name | ID |video|
+|:-:|------|----|-------|
+| 1 | Awel Abduljelil | CTC-1256-26 ||
+| 2 | Biruktawit Masresha | CTC-483-26 ||
+| 3 | Sirajudin Seid | CTC-153-26 |[![Watch the video](https://img.shields.io/badge/▶_Watch_on_YouTube-አማርኛ-red?style=for-the-badge&logo=youtube&logoColor=white)](https://drive.google.com/file/d/1nMH3Kq8i9nlyw5a1onydTl51O4j66lZp/view?usp=drive_link)
+|
+| 4 | Tsegazeab Fikre | CTC-229-26 ||
+| 5 | Gelila Fassil | CTC-3817-26 ||
+| 6 | Tirsit Bizualem | CTC-288-26 ||
+| 7 | Hana Tamirat | CTC-3776-26 ||
+
+<div align="center">
+
+  
 <div align="center">
 
 ### 🎥 Watch the full AI Firewall walkthrough in Amharic
@@ -357,25 +378,7 @@ python -m pytest
   see `src/models/README.md`.
 - **Charts use UTC** and the dashboard needs the gateway's database; it is not a standalone service.
 
-## Team
 
-<div align="center">
-
-**Built with ❤️ by the team as our final project**
-
-</div>
-
-| # | Name | ID |
-|:-:|------|----|
-| 1 | Awel Abduljelil | CTC-1256-26 |
-| 2 | Biruktawit Masresha | CTC-483-26 |
-| 3 | Sirajudin Seid | CTC-153-26 |
-| 4 | Tsegazeab Fikre | CTC-229-26 |
-| 5 | Gelila Fassil | CTC-3817-26 |
-| 6 | Tirsit Bizualem | CTC-288-26 |
-| 7 | Hana Tamirat | CTC-3776-26 |
-
-<div align="center">
 
 ⭐ If you find this project useful, please give it a star on GitHub.
 
