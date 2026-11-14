@@ -371,7 +371,7 @@ python -m pytest
 | 2 | Biruktawit Masresha | CTC-483-26 |
 | 3 | Sirajudin Seid | CTC-153-26 |
 | 4 | Tsegazeab Fikre | CTC-229-26 |
-| 5 | Gelila Fassil | CTC-3817-26 |
+| 5 | Gelila Fassil | CTC-3817-26 | [▶ WATCH GELILA'S VIDEO](https://drive.google.com/file/d/1wJgL2vnKHeLmBWgWQNp0qoTOdP-V3SFX/view?usp=sharing) |
 | 6 | Tirsit Bizualem | CTC-288-26 |
 | 7 | Hana Tamirat | CTC-3776-26 |
 
