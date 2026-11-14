@@ -29,8 +29,7 @@ inspection models run locally.
 | 1 | Awel Abduljelil | CTC-1256-26 |[![Watch Awel's video](https://img.shields.io/badge/▶_Watch_Awel's_video_-አማርኛ-red?style=for-the-badge&logo=youtube&logoColor=white)](https://drive.google.com/file/d/1ryrnqCafo4XyU2oV7BT6vVst0zaIG3Gf/view?usp=drivesdk)|
 | 2 | Biruktawit Masresha | CTC-483-26 |[![Watch Biruktaiwt's video](https://img.shields.io/badge/▶_Watch_Biruktaiwt's_video-አማርኛ-red?style=for-the-badge&logo=youtube&logoColor=white)](https://mega.nz/file/V7YBCThZ#UTYinAphpLh8MUR71nR00LSi6ru32ZpNbR_T_o5uUJk)|
 | 3 | Sirajudin Seid | CTC-153-26 |[![Watch sirajudin's video](https://img.shields.io/badge/▶_Watch_sirajudin's_video-አማርኛ-red?style=for-the-badge&logo=youtube&logoColor=white)](https://drive.google.com/file/d/1nMH3Kq8i9nlyw5a1onydTl51O4j66lZp/view?usp=drive_link)|
-| 4 | Tsegazeab Fikre |
-[![Watch Tsegazeab's video](https://img.shields.io/badge/▶_Watch_Tsegazeab's_video-አማርኛ-red?style=for-the-badge&logo=youtube&logoColor=white)](https://mega.nz/file/UMIDGLYQ#Qwsf20WUqUsEEGqyUapwJQrDkd9HQ_gGOryT8P2sb1k)|
+| 4 | Tsegazeab Fikre |[![Watch Tsegazeab's video](https://img.shields.io/badge/▶_Watch_Tsegazeab's_video-አማርኛ-red?style=for-the-badge&logo=youtube&logoColor=white)](https://mega.nz/file/UMIDGLYQ#Qwsf20WUqUsEEGqyUapwJQrDkd9HQ_gGOryT8P2sb1k)|
 | 5 | Gelila Fassil | CTC-3817-26 |[![Watch Gelila's video](https://img.shields.io/badge/▶_Watch_Gelila's_video-አማርኛ-red?style=for-the-badge&logo=youtube&logoColor=white)](https://drive.google.com/file/d/1wJgL2vnKHeLmBWgWQNp0qoTOdP-V3SFX/view?usp=sharing)|
 | 6 | Tirsit Bizualem | CTC-288-26 ||
 | 7 | Hana Tamirat | CTC-3776-26 ||
