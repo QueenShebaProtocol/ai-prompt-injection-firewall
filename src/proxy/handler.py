@@ -367,7 +367,7 @@ from fastapi.responses import JSONResponse
 from src.database.storage import write_threat_log
 from src.engine import output_scanner
 from src.engine.output_scanner import OutputScanResult, redact_completion_payload
-from src.engine.pipeline import PipelineResult, new_request_id, run_pipeline
+from src.engine.pipeline import PipelineResult, get_pipeline_config, new_request_id, run_pipeline
 from src.proxy.forwarder import forward_to_llm
 
 logger = logging.getLogger("firewall.handler")
@@ -497,12 +497,18 @@ def _fail_open_enabled() -> bool:
 
 
 def _respond(
-    status_code: int, content, request_id: str, action: str | None = None
+    status_code: int,
+    content,
+    request_id: str,
+    action: str | None = None,
+    extra_headers: dict | None = None,
 ) -> JSONResponse:
     """Every response goes through here so the request-id header is never missed."""
     headers = {REQUEST_ID_HEADER: request_id}
     if action:
         headers[ACTION_HEADER] = action
+    if extra_headers:
+        headers.update(extra_headers)
     return JSONResponse(status_code=status_code, content=content, headers=headers)
 
 
@@ -666,7 +672,77 @@ async def chat_completions(
         "system_instruction": system_instruction,
     }
 
- 
+    # Atomic snapshot of immutable config for the entire request lifecycle
+    cfg = get_pipeline_config()
+    is_firewall_enabled = getattr(cfg, "firewall_enabled", True)
+
+    if not is_firewall_enabled:
+        # FIREWALL MASTER CONTROL = OFF
+        # Bypass entire inspection pipeline (L1, L2, L3) and output scanner
+        start = time.perf_counter()
+        logger.info("Firewall master control is OFF: bypassing inspection for request_id=%s", request_id)
+        try:
+            completion = await forward_to_llm(body)
+        except httpx.HTTPStatusError as exc:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            bypass_log = {
+                **base_log,
+                "is_blocked": False,
+                "action_taken": "PASSED",
+                "triggered_layer": "NONE",
+                "risk_score": 0.0,
+                "execution_time_ms": elapsed_ms,
+                "layer_details": {"firewall_master": "OFF", "bypassed": True, "downstream_status": exc.response.status_code},
+                "detected_patterns": [],
+                "output_flagged": False,
+            }
+            background_tasks.add_task(write_threat_log, bypass_log)
+            logger.warning("Downstream returned HTTP %s for request_id=%s", exc.response.status_code, request_id)
+            return _error(
+                502,
+                "downstream_error",
+                "downstream_llm_error",
+                "The downstream model returned an error.",
+                request_id,
+            )
+        except (httpx.TimeoutException, httpx.RequestError) as exc:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            bypass_log = {
+                **base_log,
+                "is_blocked": False,
+                "action_taken": "PASSED",
+                "triggered_layer": "NONE",
+                "risk_score": 0.0,
+                "execution_time_ms": elapsed_ms,
+                "layer_details": {"firewall_master": "OFF", "bypassed": True, "error": type(exc).__name__},
+                "detected_patterns": [],
+                "output_flagged": False,
+            }
+            background_tasks.add_task(write_threat_log, bypass_log)
+            status_code = 504 if isinstance(exc, httpx.TimeoutException) else 502
+            error_code = "downstream_timeout" if isinstance(exc, httpx.TimeoutException) else "downstream_unreachable"
+            error_msg = "The downstream model did not respond in time." if isinstance(exc, httpx.TimeoutException) else "The downstream model could not be reached."
+            return _error(status_code, "downstream_error", error_code, error_msg, request_id)
+        except Exception:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            logger.exception("Unexpected error during downstream forwarding for request_id=%s", request_id)
+            return _error(500, "firewall_error", "internal_error", "An unexpected error occurred.", request_id)
+
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        bypass_log = {
+            **base_log,
+            "is_blocked": False,
+            "action_taken": "PASSED",
+            "triggered_layer": "NONE",
+            "risk_score": 0.0,
+            "execution_time_ms": elapsed_ms,
+            "layer_details": {"firewall_master": "OFF", "bypassed": True},
+            "detected_patterns": [],
+            "output_flagged": False,
+        }
+        background_tasks.add_task(write_threat_log, bypass_log)
+        return _respond(200, completion, request_id, "PASSED", extra_headers={"X-Firewall-Bypass": "true"})
+
     start = time.perf_counter()
     result = None
     try:

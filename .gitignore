@@ -32,3 +32,8 @@ Thumbs.db
 verify_schema.py
 check_fixtures.py
 perf_results/
+
+# Local backup archives and mockups
+backups/
+index/
+

@@ -7,6 +7,7 @@ proxy:
   port: 8000
 
 pipeline:
+  firewall_enabled: true          # Master ON/OFF control (default: true)
   layer_1_enabled: true
   layer_2_enabled: true           # Week 2
   layer_3_enabled: true           # Week 2

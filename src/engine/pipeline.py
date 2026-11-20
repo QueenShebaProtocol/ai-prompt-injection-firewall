@@ -54,6 +54,7 @@ OUTPUT_ON_DETECT_CHOICES = frozenset({"block", "redact", "warn"})
 
 @dataclass(frozen=True)
 class PipelineConfig:
+    firewall_enabled: bool = True
     layer_1_enabled: bool = True
     layer_2_enabled: bool = True
     layer_3_enabled: bool = True          
@@ -115,6 +116,7 @@ RUNTIME_CONFIG_ENV = "FIREWALL_RUNTIME_CONFIG_PATH"
 RUNTIME_POLL_SECONDS = 1.0
 RUNTIME_OVERLAY_KEYS: dict[str, tuple[str, ...]] = {
     "pipeline": (
+        "firewall_enabled",
         "layer_1_enabled",
         "layer_2_enabled",
         "layer_3_enabled",
@@ -200,6 +202,7 @@ def load_pipeline_config(path, runtime_path=None) -> PipelineConfig:
     d = PipelineConfig()
 
     return PipelineConfig(
+        firewall_enabled=_get_bool(pipeline, "firewall_enabled", d.firewall_enabled),
         layer_1_enabled=_get_bool(pipeline, "layer_1_enabled", d.layer_1_enabled),
         layer_2_enabled=_get_bool(pipeline, "layer_2_enabled", d.layer_2_enabled),
         layer_3_enabled=_get_bool(pipeline, "layer_3_enabled", d.layer_3_enabled),

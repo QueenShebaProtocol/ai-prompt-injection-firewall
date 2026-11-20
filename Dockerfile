@@ -31,6 +31,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
 COPY config/ ./config/
 COPY scripts/ ./scripts/
+COPY .streamlit/ ./.streamlit/
 
 # Fail the build, with a clear message, if the Layer 2 model assets are missing.
 # The model files are git-ignored, so a fresh clone does not have them.
