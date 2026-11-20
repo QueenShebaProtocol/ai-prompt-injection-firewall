@@ -35,7 +35,7 @@ TIME_RANGES: dict[str, timedelta | None] = {
     "All time": None,
 }
 DEFAULT_RANGE = "Last 24 hours"
-STATUS_OPTIONS = ["All", "Blocked", "Redacted", "Passed"]
+STATUS_OPTIONS = ["All", "Blocked", "Redacted", "Passed", "Bypassed"]
 PREVIEW_LEN = 80
 
 K_RANGE = "lf_range"
@@ -554,4 +554,3 @@ def render_log_table(page: Page) -> str | None:
 def render_detail_modal(detail: dict) -> None:
     from src.dashboard.components.drawer import open_evidence_modal
     open_evidence_modal(detail)
-

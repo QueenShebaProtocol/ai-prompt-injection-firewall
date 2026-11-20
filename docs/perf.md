@@ -2,9 +2,23 @@
 
 **Status:** Evidence-incomplete. This report deliberately does not claim that unmeasured performance targets pass.
 
+**Project:** [QueenShebaProtocol/ai-prompt-injection-firewall](https://github.com/QueenShebaProtocol/ai-prompt-injection-firewall) · **Report file:** `docs/perf.md`
+
+## Status at a glance
+
+| Area | Evidence needed | Status |
+|---|---|---|
+| Layer 1 / Layer 2 / proxy latency | `layer1_latency.json`, `layer2_latency.json`, `proxy_overhead_latency.json` | Missing |
+| Layer 3 latency and traffic share | P5 demo measurement and SQL output | Missing |
+| Hot-reload timings and failures | `hot_reload_inprocess.json`, integration test output | Missing |
+| Dashboard page loads and query plans | Browser timings, `EXPLAIN (ANALYZE, BUFFERS)` | Missing |
+
+Update this table (and the detailed tables below) only from saved result files. When a row is
+measured, change its status to `PASS` or `FAIL (measured)` and add the date and commit hash.
+
 ## Scope and evidence inventory
 
-This checkout contains the performance test harness in `tests/perf/test_latency.py` and `tests/perf/test_hot_reload.py`, plus the synthetic dashboard data generator in `scripts/scripts/seed_demo.py`. The project archive supplied for this report did **not** contain `perf_results/*.json`, P6's Monday/Wednesday benchmark artifacts, P5's Wednesday demo measurements, saved browser timings, or PostgreSQL `EXPLAIN` output. There is no separate SRS document in `docs/`; the latency thresholds below are the defaults documented in the test harness, described there as SRS section 8.1.
+This checkout contains the performance test harness in `tests/perf/test_latency.py` and `tests/perf/test_hot_reload.py`, plus the synthetic dashboard data generator in `scripts/seed_demo.py`. The project archive supplied for this report did **not** contain `perf_results/*.json`, P6's Monday/Wednesday benchmark artifacts, P5's Wednesday demo measurements, saved browser timings, or PostgreSQL `EXPLAIN` output. There is no separate SRS document in `docs/`; the latency thresholds below are the defaults documented in the test harness, described there as SRS section 8.1.
 
 Therefore:
 - **FAIL (evidence gate)** means the requested acceptance evidence is absent; it does **not** mean a benchmark was run and measured slower than its threshold.
@@ -34,7 +48,7 @@ The test harness records p50/p95/p99/max in milliseconds. Its verdict is based o
 | Layer 2 ONNX `predict()` | 200 measured + 20 warm-up (plus model warm-up) | NOT MEASURED | NOT MEASURED | NOT MEASURED | `< 30 ms` | **FAIL — result JSON missing** |
 | Proxy request overhead | 300 measured + 30 warm-up | NOT MEASURED | NOT MEASURED | NOT MEASURED | `< 20 ms` | **FAIL — result JSON missing** |
 
-**Interpretation and next step:** these verdicts flag missing acceptance evidence, not measured latency failures. Obtain `layer1_latency.json`, `layer2_latency.json`, and `proxy_overhead_latency.json` from P6. If any file is absent, run the commands in [How to reproduce](#how-to-reproduce) on the intended test machine and retain the generated JSON. Layer 2 cannot be measured unless its real, non-empty ONNX model and tokenizer assets are installed locally; the repository notes that these assets may be git-ignored.
+**Interpretation and next step:** these verdicts flag missing acceptance evidence, not measured latency failures. Obtain `layer1_latency.json`, `layer2_latency.json`, and `proxy_overhead_latency.json` from P6. If any file is absent, run the commands in [How to reproduce](#how-to-reproduce) on the intended test machine and retain the generated JSON. Layer 2 cannot be measured unless its real, non-empty ONNX model and tokenizer assets are installed locally; the model files are git-ignored (about 740 MB), so each machine must download them first (see step 1 of How to reproduce).
 
 The proxy test uses an in-process FastAPI ASGI transport, a fake immediate downstream, and a no-op log writer. Its number is **proxy overhead under this harness**, not end-to-end provider latency.
 
@@ -159,7 +173,15 @@ docker compose version
 docker compose ps
 ```
 
-Confirm `src/models/classifier.onnx` and `src/models/tokenizer/tokenizer.json` are present and non-empty before the Layer 2 benchmark. Do not create empty placeholders.
+Confirm `src/models/classifier.onnx` and `src/models/tokenizer/tokenizer.json` are present and non-empty before the Layer 2 benchmark. Do not create empty placeholders. They are not stored in git; download them once:
+
+```bash
+mkdir -p src/models/tokenizer
+BASE=https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2/resolve/main/onnx
+curl -L --fail -o src/models/classifier.onnx "$BASE/model.onnx"
+curl -L --fail -o src/models/tokenizer/tokenizer.json "$BASE/tokenizer.json"
+ls -lh src/models src/models/tokenizer
+```
 
 ### 2. Install test dependencies and run microbenchmarks
 
