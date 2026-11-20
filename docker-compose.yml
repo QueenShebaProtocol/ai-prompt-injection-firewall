@@ -44,6 +44,9 @@ services:
     ports:
       - "${PROXY_PORT:-8000}:8000"
     volumes:
+      - ./src/engine:/app/src/engine:ro
+      - ./src/proxy:/app/src/proxy:ro
+      - ./src/database:/app/src/database:ro
       - ./config:/app/config:ro
       - firewall_runtime:/app/runtime:ro
     networks:
@@ -59,6 +62,9 @@ services:
 
 
   dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: ai-prompt-injection-firewall:local
     container_name: firewall_dashboard
     restart: unless-stopped
@@ -77,7 +83,11 @@ services:
     ports:
       - "127.0.0.1:8501:8501"
     volumes:
+      - ./src/engine:/app/src/engine:ro
+      - ./src/dashboard:/app/src/dashboard:ro
+      - ./src/database:/app/src/database:ro
       - ./config:/app/config:ro
+      - ./.streamlit:/app/.streamlit:ro
       - firewall_runtime:/app/runtime:rw
     networks:
       - firewall_private

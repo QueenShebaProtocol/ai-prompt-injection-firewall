@@ -1,9 +1,9 @@
 [theme]
 base = "dark"
-primaryColor = "#e8b75b"
-backgroundColor = "#061225"
-secondaryBackgroundColor = "#091a30"
-textColor = "#edf3ff"
+primaryColor = "#D9AE5B"
+backgroundColor = "#070B16"
+secondaryBackgroundColor = "#0E1424"
+textColor = "#ECE6D6"
 font = "sans serif"
 
 [server]
@@ -12,3 +12,10 @@ headless = true
 
 [browser]
 gatherUsageStats = false
+
+[client]
+showSidebarNavigation = false
+toolbarMode = "minimal"
+
+[runner]
+fastReruns = true

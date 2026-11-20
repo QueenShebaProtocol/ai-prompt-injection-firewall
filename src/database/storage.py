@@ -720,6 +720,7 @@ class LogFilters:
     client_ip: str | None = None
     min_risk: float | None = None          # risk_score >= min_risk
     text: str | None = None                # case-insensitive "contains" on raw_prompt
+    bypassed_only: bool | None = None      # filter for firewall-master-OFF bypass records
 
 
 @dataclass
@@ -765,6 +766,10 @@ def _apply_filters(stmt, f: LogFilters | None):
         stmt = stmt.where(
             ThreatLog.raw_prompt.ilike(f"%{_escape_like(f.text)}%", escape="\\")
         )
+    if f.bypassed_only:
+        stmt = stmt.where(
+            ThreatLog.layer_details.op("@>")(text('\'{"firewall_master": "OFF"}\'::jsonb'))
+        )
     return stmt
 
 
@@ -774,11 +779,15 @@ async def get_kpi_summary(hours: int = 24, offset_hours: int = 0) -> dict:
     """Headline numbers for the last `hours` hours.
 
     offset_hours=hours gives the PREVIOUS period (for the delta on the KPI cards).
+    Bypassed requests (firewall_master: "OFF") are tracked distinctly and excluded
+    from safe inspection metrics: Safe = Total - Blocked - Bypassed.
     """
     start, end = _window(hours, offset_hours)
+    bypassed_filter = ThreatLog.layer_details.op("@>")(text('\'{"firewall_master": "OFF"}\'::jsonb'))
     stmt = select(
         func.count().label("total"),
         func.count().filter(ThreatLog.is_blocked.is_(True)).label("blocked"),
+        func.count().filter(bypassed_filter).label("bypassed"),
         func.coalesce(func.avg(ThreatLog.execution_time_ms), 0.0).label("avg_latency"),
         func.coalesce(
             func.percentile_cont(0.95).within_group(ThreatLog.execution_time_ms), 0.0
@@ -790,10 +799,15 @@ async def get_kpi_summary(hours: int = 24, offset_hours: int = 0) -> dict:
 
     total = int(row.total)
     blocked = int(row.blocked)
+    bypassed = int(row.bypassed)
+    safe = max(0, total - blocked - bypassed)
+    inspected = max(0, total - bypassed)
     return {
         "total_requests": total,
         "blocked_requests": blocked,
-        "block_rate": (blocked / total) if total else 0.0,   # 0.0 - 1.0
+        "bypassed_requests": bypassed,
+        "safe_requests": safe,
+        "block_rate": (blocked / inspected) if inspected else 0.0,   # 0.0 - 1.0 of inspected traffic
         "avg_latency_ms": float(row.avg_latency or 0.0),
         "p95_latency_ms": float(row.p95_latency or 0.0),
         "hours": max(1, int(hours)),
