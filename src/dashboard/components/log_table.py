@@ -66,7 +66,8 @@ def get_active_filters() -> LogFilters:
     text = (st.session_state.get("lf_text") or "").strip() or None
     min_risk = float(st.session_state.get("lf_risk") or 0.0)
     status_choice = st.session_state.get("lf_status_choice", "All")
-    is_blocked = True if status_choice == "Blocked" else (False if status_choice == "Passed" else None)
+    is_blocked = True if status_choice == "Blocked" else (False if status_choice in ("Passed", "Redacted") else None)
+    action_taken = {"Redacted": "REDACTED", "Passed": "PASSED"}.get(status_choice)
     bypassed_only = True if status_choice == "Bypassed" else None
     return LogFilters(
         start=_time_window(range_label),
@@ -77,6 +78,7 @@ def get_active_filters() -> LogFilters:
         min_risk=min_risk if min_risk > 0 else None,
         text=text,
         bypassed_only=bypassed_only,
+        action_taken=action_taken,
     )
 def render_filters(defaults: LogFilters | None = None, matching_count: int | None = None) -> LogFilters:
     """Draw the filters card matching the target UI design exactly."""
@@ -129,7 +131,8 @@ def render_filters(defaults: LogFilters | None = None, matching_count: int | Non
             )
 
     # Determine is_blocked and action filter
-    is_blocked = True if status_choice == "Blocked" else (False if status_choice == "Passed" else None)
+    is_blocked = True if status_choice == "Blocked" else (False if status_choice in ("Passed", "Redacted") else None)
+    action_taken = {"Redacted": "REDACTED", "Passed": "PASSED"}.get(status_choice)
     bypassed_only = True if status_choice == "Bypassed" else None
     return LogFilters(
         start=_time_window(range_label),
@@ -140,6 +143,7 @@ def render_filters(defaults: LogFilters | None = None, matching_count: int | Non
         min_risk=min_risk if min_risk > 0 else None,
         text=(text or "").strip() or None,
         bypassed_only=bypassed_only,
+        action_taken=action_taken,
     )
 
 

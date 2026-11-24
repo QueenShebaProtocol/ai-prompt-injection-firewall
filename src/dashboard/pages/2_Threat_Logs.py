@@ -316,6 +316,9 @@ def main() -> None:
                 width='stretch',
             )
 
+    # Hold the live refresh while an evidence dialog is open so it is not closed under the reader.
+    st.session_state["_pause_refresh"] = bool(selected_id)
+
     # Handle Evidence Drawer
     if selected_id:
         try:
