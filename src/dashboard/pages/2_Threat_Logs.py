@@ -5,6 +5,7 @@ Master replication of index/index.html Forensics screen.
 from __future__ import annotations
 
 import csv
+import html
 import io
 import json
 import logging
@@ -31,9 +32,11 @@ from src.dashboard.components.log_table import (
     render_log_table,
 )
 from src.dashboard.components.sidebar import render_sidebar
+from src.dashboard.session import restore_admin_session, sync_session_cookie
 from src.dashboard.styles import inject_theme
 from src.database.storage import (
     LogFilters,
+    delete_threat_log,
     export_threat_logs,
     get_log_detail,
     run_sync,
@@ -128,6 +131,79 @@ def _safe_page_size() -> int:
     except (TypeError, ValueError):
         size = DEFAULT_PAGE_SIZE
     return min(max(1, size), MAX_PAGE_SIZE)
+
+
+# ---------------------------------------------------------------------- Delete a log entry
+def _clear_delete_param() -> None:
+    try:
+        del st.query_params["delete_log"]
+    except Exception:
+        pass
+
+
+def _handle_delete_request(admin_user: str) -> None:
+    """Confirm and carry out a delete started by the trash icon (``?delete_log=<request id>``).
+
+    Nothing is deleted by the link itself: the administrator must press the
+    confirmation button, and the signed-in check is repeated here on the server.
+    """
+    flash = st.session_state.pop("_log_delete_flash", None)
+    if flash:
+        getattr(st, flash[0])(flash[1])
+
+    raw = st.query_params.get("delete_log")
+    target = str(raw)[:128].strip() if raw else ""
+    if not target:
+        return
+    if not admin_user:
+        _clear_delete_param()
+        st.warning("Only a signed-in administrator can delete log entries. Sign in on the Configuration page, then try again.")
+        return
+
+    try:
+        detail = run_sync(get_log_detail(target))
+    except Exception:
+        logger.error("Could not load log entry for deletion", exc_info=True)
+        _clear_delete_param()
+        st.error(DB_ERROR_MESSAGE)
+        return
+    if detail is None:
+        _clear_delete_param()
+        st.info("That log entry no longer exists.")
+        return
+
+    when = detail.get("created_at")
+    when_txt = when.strftime("%Y-%m-%d %H:%M:%S UTC") if hasattr(when, "strftime") else str(when)
+    with st.container(border=True):
+        st.markdown(
+            f"**Delete this log entry permanently?**  \n"
+            f"`{html.escape(target)}` · {html.escape(str(detail.get('client_ip', '')))} · "
+            f"{html.escape(str(detail.get('action_taken', '')))} · {html.escape(when_txt)}"
+        )
+        st.code(str(detail.get("raw_prompt") or "")[:300], language=None)
+        st.caption(
+            "The prompt, system instruction and model output are removed from the database and cannot be recovered. "
+            "The deletion is recorded in the audit log. Dashboard totals for the period will drop by one request."
+        )
+        c_ok, c_cancel = st.columns(2)
+        with c_ok:
+            confirmed = st.button("Delete permanently", type="primary", key="btn_confirm_delete_log", width="stretch")
+        with c_cancel:
+            cancelled = st.button("Cancel", key="btn_cancel_delete_log", width="stretch")
+    if confirmed:
+        try:
+            removed = run_sync(delete_threat_log(target, admin_user))
+            st.session_state["_log_delete_flash"] = (
+                ("success", "Log entry deleted.") if removed else ("info", "That log entry no longer exists.")
+            )
+        except Exception:
+            logger.error("Deleting log entry failed", exc_info=True)
+            st.session_state["_log_delete_flash"] = ("error", "Could not delete the log entry. Check the database connection.")
+        _clear_delete_param()
+        st.rerun()
+    if cancelled:
+        _clear_delete_param()
+        st.rerun()
 
 
 # ---------------------------------------------------------------------- Page Runner
@@ -239,6 +315,10 @@ def main() -> None:
         height=0,
     )
 
+    admin_user = restore_admin_session()
+    sync_session_cookie(bool(admin_user))
+    _handle_delete_request(admin_user)
+
     # Filters & Query
     filters = render_filters(
         defaults=st.session_state.get(K_FILTERS),
@@ -273,7 +353,7 @@ def main() -> None:
         st.session_state["logs_last_total"] = total
 
     # Render Table
-    selected_id = render_log_table(page)
+    selected_id = render_log_table(page, can_delete=bool(admin_user))
 
     # Pager bar matching index.html
     first_row = 0 if total == 0 else (st.session_state[K_PAGE] - FIRST_PAGE) * page_size + 1

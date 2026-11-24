@@ -357,6 +357,7 @@ the server log and in `threat_logs`.
 import copy
 import inspect
 import logging
+import asyncio
 import os
 import time
 
@@ -364,7 +365,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 
-from src.database.storage import write_threat_log
+from src.database.storage import get_blocked_ips, normalize_client_ip, write_threat_log
 from src.engine import output_scanner
 from src.engine.output_scanner import OutputScanResult, redact_completion_payload
 from src.engine.pipeline import PipelineResult, get_pipeline_config, new_request_id, run_pipeline
@@ -627,6 +628,66 @@ def _log_entry_scanner_failure(
     return out
 
 
+# Blocked clients can hammer the gateway; log at most one row per IP per interval so the
+# blocklist cannot be used to fill the database.
+_BLOCKED_LOG_INTERVAL_S = 60.0
+_blocked_last_logged: dict[str, float] = {}
+
+
+async def _refuse_if_ip_blocked(
+    client_ip: str,
+    request_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> JSONResponse | None:
+    """Return a 403 response when `client_ip` is on the admin blocklist, else None.
+
+    A blocklist lookup failure never stops traffic: the inspection pipeline still runs.
+    """
+    try:
+        ip = normalize_client_ip(client_ip)
+    except ValueError:
+        return None  # e.g. "unknown": cannot be on the list
+    try:
+        blocked = await asyncio.wait_for(get_blocked_ips(), timeout=1.0)
+    except Exception:
+        logger.warning("IP blocklist lookup failed; continuing with normal inspection", exc_info=True)
+        return None
+    if ip not in blocked:
+        return None
+
+    now = time.monotonic()
+    if now - _blocked_last_logged.get(ip, -1e9) >= _BLOCKED_LOG_INTERVAL_S:
+        _blocked_last_logged[ip] = now
+        background_tasks.add_task(
+            write_threat_log,
+            {
+                "request_id": request_id,
+                "client_ip": client_ip,
+                "application_id": request.headers.get("X-Application-Id", "unknown"),
+                "target_model": "unknown",
+                "raw_prompt": "[not stored: client IP is on the blocklist]",
+                "system_instruction": None,
+                "is_blocked": True,
+                "action_taken": "BLOCKED",
+                "triggered_layer": "LAYER_1",
+                "risk_score": 1.0,
+                "execution_time_ms": 0.0,
+                "layer_details": {"ip_blocklist": {"client_ip": ip, "blocked": True}},
+                "detected_patterns": ["IP_BLOCKLIST"],
+                "output_flagged": False,
+            },
+        )
+    return _error(
+        403,
+        "client_blocked",
+        "client_blocked",
+        "Access denied.",
+        request_id,
+        action="BLOCKED",
+    )
+
+
 @router.get("/healthz")
 async def healthz() -> dict:
     return {"status": "ok"}
@@ -658,6 +719,11 @@ async def chat_completions(
         return _error(400, "invalid_request_error", code, message, request_id)
 
     client_ip = request.client.host if request.client else "unknown"
+
+    # Admin-maintained IP blocklist: refuse before any inspection, forwarding or prompt storage.
+    blocked_response = await _refuse_if_ip_blocked(client_ip, request_id, request, background_tasks)
+    if blocked_response is not None:
+        return blocked_response
     application_id = request.headers.get("X-Application-Id", "unknown")
     target_model = body.get("model") or "unknown"
 

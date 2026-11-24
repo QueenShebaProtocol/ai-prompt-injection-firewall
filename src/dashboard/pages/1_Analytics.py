@@ -33,6 +33,7 @@ from src.dashboard.components.charts import (
     threat_volume_chart,
 )
 from src.dashboard.components.metrics_cards import render_kpi_cards
+from src.dashboard.components.ip_block import render_ip_block_panel
 from src.dashboard.components.sidebar import render_sidebar
 from src.dashboard.styles import inject_theme
 from src.database.connection import AsyncSessionLocal, check_database_connection, engine
@@ -485,6 +486,8 @@ with g3_c2:
             '<div class="table-wrap"><div class="empty">No client IP traffic in this period.</div></div>',
             unsafe_allow_html=True,
         )
+
+    render_ip_block_panel()
 
 st.markdown('<div style="height:16px;"></div>', unsafe_allow_html=True)
 

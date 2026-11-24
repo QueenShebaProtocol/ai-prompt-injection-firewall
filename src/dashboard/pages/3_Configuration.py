@@ -1081,6 +1081,12 @@ def main() -> None:
                     msg = f"Updated rule {target}"
                 elif act == "RULE_DELETED":
                     msg = f"Deleted rule {target}"
+                elif act == "LOG_DELETED":
+                    msg = f"Deleted log entry {target}"
+                elif act == "IP_BLOCKED":
+                    msg = f"Blocked client IP {target}"
+                elif act == "IP_UNBLOCKED":
+                    msg = f"Unblocked client IP {target}"
                 audit_html.append(
                     f'<li>'
                     f'<time class="mono">{html.escape(t_str)}</time>'
