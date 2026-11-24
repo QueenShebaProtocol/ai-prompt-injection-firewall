@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 import json
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -147,11 +148,15 @@ def render_filters(defaults: LogFilters | None = None, matching_count: int | Non
     )
 
 
-def render_log_table(page: Page) -> str | None:
+def render_log_table(page: Page, can_delete: bool = False) -> str | None:
     """Show the table of threat logs matching index/index.html.
 
     Clicking ANY row in the table instantly slides out the Decision Evidence
     drawer from the right side, displaying full evidence matching index.html.
+
+    With ``can_delete`` (a signed-in administrator) every row also gets a trash icon.
+    The icon links to ``?delete_log=<request id>``; the page then asks for confirmation
+    before anything is removed.
     """
     rows = list(page.items) if page else []
 
@@ -264,6 +269,16 @@ def render_log_table(page: Page) -> str | None:
             f'<span class="tag mono" style="font-size:10px;padding:1px 5px;opacity:.7">{html.escape(direction)}</span>'
         )
         prompt_preview = _preview(prompt)
+        if can_delete:
+            del_cell = (
+                f'<td class="del-cell"><a class="row-del" href="?delete_log={html.escape(quote(rid, safe=""))}" target="_self" '
+                f'title="Delete this log entry" aria-label="Delete log entry {html.escape(rid[:13])}">'
+                '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+                '<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>'
+                '<path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg></a></td>'
+            )
+        else:
+            del_cell = ''
         rid_safe = html.escape(rid)
 
         rows_html.append(
@@ -277,6 +292,7 @@ def render_log_table(page: Page) -> str | None:
             f'<td>{act_badge}</td>'
             f'<td><span class="tag mono">{html.escape(layer)}</span> {dir_tag}</td>'
             f'<td>{risk_html}</td>'
+            f'{del_cell}'
             f'<td class="trunc">{html.escape(prompt_preview)}</td>'
             f'</tr>'
         )
@@ -285,6 +301,11 @@ def render_log_table(page: Page) -> str | None:
 
     # Full table with Wazuh-style Expand/Fullscreen Toolbar + Slide-out Drawer
     table_and_drawer_html = f"""
+    <style>
+      .row-del{{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:6px;color:var(--muted);text-decoration:none;border:1px solid transparent}}
+      .row-del:hover,.row-del:focus-visible{{color:var(--danger);background:rgba(235,94,85,.12);border-color:rgba(235,94,85,.45)}}
+      td.del-cell{{width:40px;padding-left:6px;padding-right:6px;text-align:center}}
+    </style>
     <div class="table-wrap">
       <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line);background:var(--surface);">
         <span style="font-size:12px;color:var(--muted);font-weight:500;">Forensics log stream · Click any row to inspect decision evidence</span>
@@ -305,6 +326,7 @@ def render_log_table(page: Page) -> str | None:
             <th>Action</th>
             <th>Layer / Direction</th>
             <th>Risk</th>
+            {"<th></th>" if can_delete else ""}
             <th>Prompt preview</th>
           </tr>
         </thead>
@@ -503,6 +525,7 @@ def render_log_table(page: Page) -> str | None:
         if (!pwin.__SHEBA_EVENTS_ATTACHED__) {{
           pwin.__SHEBA_EVENTS_ATTACHED__ = true;
           pdoc.addEventListener('click', function(e) {{
+            if (e.target.closest('.row-del')) return;  // trash icon: follow its link, do not open the drawer
             const tr = e.target.closest('tr[data-id]');
             if (tr && tr.dataset && tr.dataset.id) {{
               pwin.shebaOpenDrawer(tr.dataset.id);
@@ -539,6 +562,7 @@ def render_log_table(page: Page) -> str | None:
               const wrap = pdoc.querySelector('.table-wrap.fullscreen');
               if (wrap) pwin.shebaToggleFullscreenTable();
             }}
+            if (e.target.closest && e.target.closest('.row-del')) return;
             const tr = e.target.closest && e.target.closest('tr[data-id]');
             if (tr && e.key === 'Enter') {{
               pwin.shebaOpenDrawer(tr.dataset.id);

@@ -26,6 +26,7 @@ Functions in this file:
 """
 
 import asyncio
+import ipaddress
 import re
 import copy
 import functools
@@ -37,13 +38,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
-from sqlalchemy import and_, func, literal_column, select, text
+from sqlalchemy import and_, delete, func, literal_column, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from src.database.connection import AsyncSessionLocal
 from src.database.models import (
     AdminAuditLog,
+    BlockedClient,
     FirewallRule,
     SystemMetric,
     ThreatLog,
@@ -390,6 +392,9 @@ _VALID_AUDIT_ACTIONS = {
     "RULE_UPDATED",
     "RULE_DELETED",
     "THRESHOLD_CHANGED",
+    "LOG_DELETED",
+    "IP_BLOCKED",
+    "IP_UNBLOCKED",
 }
 
 
@@ -1483,3 +1488,122 @@ async def delete_rule(rule_id: str, admin_user: str) -> None:
             raise
 
     logger.info("Rule %s deleted by %s", rule_id, admin)
+
+
+# --- Admin actions: delete a log entry, block / unblock a client IP ---------------
+def normalize_client_ip(value: Any) -> str:
+    """Return the canonical text of one IPv4/IPv6 address, or raise ValueError.
+
+    IPv4-mapped IPv6 addresses (::ffff:1.2.3.4) are folded to plain IPv4 so the
+    dashboard and the gateway always compare the same text.
+    """
+    raw = str(value or "").strip()
+    try:
+        addr = ipaddress.ip_address(raw)
+    except ValueError:
+        raise ValueError("Enter a valid IPv4 or IPv6 address, for example 172.20.0.1.") from None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return str(addr)
+
+
+def _clear_read_caches() -> None:
+    """Drop every ttl_cache'd getter so the dashboard shows an admin change at once."""
+    for obj in list(globals().values()):
+        clear = getattr(obj, "cache_clear", None)
+        if callable(clear):
+            try:
+                clear()
+            except Exception:  # pragma: no cover - cache clearing must never break an admin action
+                logger.debug("cache_clear failed for %r", obj, exc_info=True)
+
+
+async def delete_threat_log(request_id: str, admin_user: str) -> bool:
+    """Permanently delete one threat_logs row (prompt, completion and all) and audit it.
+
+    The audit entry records who deleted which request and its outcome, but never the
+    prompt text. Returns False if the request_id does not exist.
+    """
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise ValueError("request_id is required")
+    async with AsyncSessionLocal() as session:
+        row = (
+            await session.execute(select(ThreatLog).where(ThreatLog.request_id == rid))
+        ).scalar_one_or_none()
+        if row is None:
+            return False
+        summary = {
+            "request_id": rid,
+            "client_ip": row.client_ip,
+            "action_taken": row.action_taken,
+            "triggered_layer": row.triggered_layer,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        await session.execute(delete(ThreatLog).where(ThreatLog.request_id == rid))
+        await write_audit_log(
+            admin_user=admin_user, action="LOG_DELETED", target_rule_id=rid, details=summary, session=session
+        )
+        await session.commit()
+    _clear_read_caches()
+    return True
+
+
+@ttl_cache(5)
+async def get_blocked_ips() -> set:
+    """The set of blocked client IPs. Cached for 5 s, so a new block reaches the gateway within ~5 s."""
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(select(BlockedClient.client_ip))).scalars().all()
+    return set(rows)
+
+
+async def list_blocked_clients() -> list[dict]:
+    """Every blocked client, newest first (not cached: the admin panel must be exact)."""
+    stmt = select(BlockedClient).order_by(BlockedClient.created_at.desc())
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(stmt)).scalars().all()
+    return [
+        {"client_ip": r.client_ip, "reason": r.reason or "", "blocked_by": r.blocked_by, "created_at": r.created_at}
+        for r in rows
+    ]
+
+
+async def block_client_ip(client_ip: str, admin_user: str, reason: str | None = None) -> bool:
+    """Add an IP to the blocklist and audit it. Returns False if it was already blocked."""
+    ip = normalize_client_ip(client_ip)
+    note = (reason or "").strip()[:200] or None
+    try:
+        async with AsyncSessionLocal() as session:
+            existing = (
+                await session.execute(select(BlockedClient.id).where(BlockedClient.client_ip == ip))
+            ).scalar_one_or_none()
+            if existing is not None:
+                return False
+            session.add(BlockedClient(client_ip=ip, reason=note, blocked_by=admin_user.strip()))
+            await write_audit_log(
+                admin_user=admin_user,
+                action="IP_BLOCKED",
+                target_rule_id=ip,
+                details={"client_ip": ip, "reason": note},
+                session=session,
+            )
+            await session.commit()
+    except IntegrityError:  # two admins blocked the same IP at once
+        return False
+    _clear_read_caches()
+    return True
+
+
+async def unblock_client_ip(client_ip: str, admin_user: str) -> bool:
+    """Remove an IP from the blocklist and audit it. Returns False if it was not blocked."""
+    ip = normalize_client_ip(client_ip)
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(delete(BlockedClient).where(BlockedClient.client_ip == ip))
+        if not result.rowcount:
+            return False
+        await write_audit_log(
+            admin_user=admin_user, action="IP_UNBLOCKED", target_rule_id=ip, details={"client_ip": ip}, session=session
+        )
+        await session.commit()
+    _clear_read_caches()
+    return True

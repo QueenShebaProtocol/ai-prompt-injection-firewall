@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     Index,
     CheckConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base
@@ -112,6 +113,24 @@ class SystemMetric(Base):
     )
 
 
+class BlockedClient(Base):
+    """Client IPs an administrator has blocked. The gateway refuses their requests."""
+
+    __tablename__ = "blocked_clients"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    client_ip = Column(String, unique=True, nullable=False)
+    reason = Column(Text, nullable=True)
+    blocked_by = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+_AUDIT_ACTIONS_SQL = (
+    "action IN ('RULE_CREATED', 'RULE_UPDATED', 'RULE_DELETED', 'THRESHOLD_CHANGED', "
+    "'LOG_DELETED', 'IP_BLOCKED', 'IP_UNBLOCKED')"
+)
+
+
 class AdminAuditLog(Base):
     __tablename__ = "admin_audit_logs"
 
@@ -125,7 +144,7 @@ class AdminAuditLog(Base):
     __table_args__ = (
         Index("ix_admin_audit_logs_timestamp_desc", timestamp.desc()),
         CheckConstraint(
-            "action IN ('RULE_CREATED', 'RULE_UPDATED', 'RULE_DELETED', 'THRESHOLD_CHANGED')",
+            _AUDIT_ACTIONS_SQL,
             name="check_audit_action"
         ),
     )
@@ -135,3 +154,16 @@ async def init_schema(engine) -> None:
     """Asynchronously initialize database schema (idempotent create_all)."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # create_all never alters an existing table, so databases created before the
+        # LOG_DELETED / IP_BLOCKED / IP_UNBLOCKED audit actions existed still carry the
+        # old CHECK constraint. Widen it once (a no-op when it is already current).
+        current = (
+            await conn.execute(
+                text("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'check_audit_action'")
+            )
+        ).scalar_one_or_none()
+        if current is not None and "IP_BLOCKED" not in current:
+            await conn.execute(text("ALTER TABLE admin_audit_logs DROP CONSTRAINT check_audit_action"))
+            await conn.execute(
+                text(f"ALTER TABLE admin_audit_logs ADD CONSTRAINT check_audit_action CHECK ({_AUDIT_ACTIONS_SQL})")
+            )
