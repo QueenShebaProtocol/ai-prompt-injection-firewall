@@ -721,6 +721,7 @@ class LogFilters:
     min_risk: float | None = None          # risk_score >= min_risk
     text: str | None = None                # case-insensitive "contains" on raw_prompt
     bypassed_only: bool | None = None      # filter for firewall-master-OFF bypass records
+    action_taken: str | None = None        # PASSED | BLOCKED | REDACTED (exact match)
 
 
 @dataclass
@@ -754,6 +755,8 @@ def _apply_filters(stmt, f: LogFilters | None):
         stmt = stmt.where(ThreatLog.created_at < f.end)
     if f.is_blocked is not None:
         stmt = stmt.where(ThreatLog.is_blocked.is_(bool(f.is_blocked)))
+    if f.action_taken:
+        stmt = stmt.where(ThreatLog.action_taken == str(f.action_taken).upper())
     if f.triggered_layer:
         if f.triggered_layer not in _VALID_LAYERS:
             raise ValueError(f"Unknown triggered_layer: {f.triggered_layer!r}")

@@ -29,6 +29,12 @@ from sqlalchemy import select
 
 from src.dashboard.assets import get_crest_data_uri
 from src.dashboard.components.sidebar import render_sidebar
+from src.dashboard.session import (
+    create_admin_session,
+    end_admin_session,
+    restore_admin_session,
+    sync_session_cookie,
+)
 from src.dashboard.styles import inject_theme
 from src.database.models import AdminAuditLog
 from src.database.storage import (
@@ -357,11 +363,12 @@ def main() -> None:
     )
 
     inject_theme()
-    render_sidebar(current_page="config")
+    # No auto-refresh here: a rerun mid-edit would discard half-typed rule and setting changes.
+    render_sidebar(current_page="config", auto_refresh=False)
 
     # Handle signout query param
     if st.query_params.get("signout") in ("1", "true") or st.query_params.get("action") == "signout":
-        st.session_state.pop("admin_user", None)
+        end_admin_session()
         try:
             del st.query_params["signout"]
         except Exception:
@@ -372,7 +379,9 @@ def main() -> None:
             pass
         st.rerun()
 
-    admin_user = st.session_state.get("admin_user", "")
+    # Restore the login from the server-side session after a page reload.
+    admin_user = restore_admin_session()
+    sync_session_cookie(bool(admin_user))
     crest_uri = get_crest_data_uri()
 
     # Topbar
@@ -428,7 +437,7 @@ def main() -> None:
 
             # Native Streamlit button bridge
             if st.button("Sign out", key="btn_sign_out", width="content"):
-                st.session_state.pop("admin_user", None)
+                end_admin_session()
                 st.rerun()
 
             # Parent-window interactive controller for dropdown click/escape & logout bridge
@@ -552,6 +561,7 @@ def main() -> None:
                     st.error("Invalid administrator password.")
                 else:
                     st.session_state["admin_user"] = clean
+                    create_admin_session(clean)
                     st.session_state["_login_failures"] = 0
                     st.success("Access granted.")
                     st.rerun()

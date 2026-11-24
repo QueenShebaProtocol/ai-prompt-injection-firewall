@@ -21,6 +21,7 @@ from src.dashboard.assets import (
     ICON_SHIELD,
     get_crest_data_uri,
 )
+from src.dashboard.session import REFRESH_COOKIE, get_cookie, saved_refresh_seconds, set_refresh_cookie, start_auto_refresh
 
 logger = logging.getLogger("firewall.dashboard.sidebar")
 _ROOT = Path(__file__).resolve().parents[3]
@@ -100,7 +101,10 @@ PAGE_TITLES = {
 }
 
 
-def render_sidebar(current_page: Literal["overview", "analytics", "logs", "config"] = "overview") -> dict:
+def render_sidebar(
+    current_page: Literal["overview", "analytics", "logs", "config"] = "overview",
+    auto_refresh: bool = True,
+) -> dict:
     """Render the master sidebar with intelligent responsive drawer support."""
     crest_uri = get_crest_data_uri()
     blocked_count = get_blocked_count()
@@ -184,10 +188,12 @@ def render_sidebar(current_page: Literal["overview", "analytics", "logs", "confi
         # Spacer pushes refresh interval and system status to bottom
         st.markdown('<div class="side-spacer"></div>', unsafe_allow_html=True)
 
+        _refresh_options = [15, 30, 60, 0]
+        _saved_refresh = saved_refresh_seconds(30)
         refresh_seconds = st.selectbox(
             "Refresh interval",
-            options=[15, 30, 60, 0],
-            index=1,
+            options=_refresh_options,
+            index=_refresh_options.index(_saved_refresh) if _saved_refresh in _refresh_options else 1,
             format_func=lambda s: "Off" if s == 0 else (f"{s} seconds" if s < 60 else "1 minute"),
             key="side_refresh_seconds",
         )
@@ -205,6 +211,12 @@ def render_sidebar(current_page: Literal["overview", "analytics", "logs", "confi
             """,
             unsafe_allow_html=True,
         )
+
+    # Remember the chosen interval across page loads and live-refresh the page on it.
+    if get_cookie(REFRESH_COOKIE) != str(refresh_seconds):
+        set_refresh_cookie(refresh_seconds)
+    if auto_refresh:
+        start_auto_refresh(refresh_seconds)
 
     # Inject responsive sidebar controller (executes seamlessly in parent window)
     components.html(
