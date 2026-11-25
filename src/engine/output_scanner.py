@@ -12,6 +12,11 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Mapping, Sequence
 
+import hashlib
+import threading
+import time
+from collections import OrderedDict
+
 
 logger = logging.getLogger("firewall.output_scanner")
 
@@ -46,6 +51,12 @@ class OutputScanResult:
     categories: list[str] = field(default_factory=list)
     spans: list[Span] = field(default_factory=list)
     action: str = "PASS"  # PASS | BLOCK | REDACT | WARN
+    # True when the leak check did not cover all the text (see scan limits).
+    truncated: bool = False
+    system_truncated: bool = False
+    completion_truncated: bool = False
+    system_chars: int = 0
+    completion_chars: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -136,12 +147,45 @@ _WORD_RE = re.compile(r"\w+")
 
 SYSTEM_PROMPT_LEAK = "SYSTEM_PROMPT_LEAK"
 
-# Scan limits (keeps the detector fast and its cost predictable).
-# Only the first MAX_COMPLETION_CHARS characters of a completion are scanned,
-# so a leak that starts after that point is not detected.
-# Only the first MAX_SYSTEM_CHARS characters of the system instruction are used.
-MAX_COMPLETION_CHARS = 20_000
-MAX_SYSTEM_CHARS = 50_000
+# Scan limits. They protect the firewall itself from absurd inputs; they are
+# NOT meant to be hit by normal traffic.
+#
+# The old MAX_SYSTEM_CHARS (50,000) was a safety cap, not measured from real
+# prompt sizes, and it silently skipped the tail of long prompts (RAG context,
+# long policies). The default is now 1,000,000 characters (about 250k tokens,
+# above current model context windows). The shingle set is cached per system
+# prompt, so a long prompt is paid for once, not per request. Both limits are
+# set in config/firewall.yaml (output_scanner.*) and passed in by scan_output().
+# Exceeding either limit is never silent: it is logged and reported through
+# the `truncated` flags.
+DEFAULT_MAX_SYSTEM_CHARS = 1_000_000
+DEFAULT_MAX_COMPLETION_CHARS = 200_000
+MAX_SYSTEM_CHARS = DEFAULT_MAX_SYSTEM_CHARS          # kept for old imports
+MAX_COMPLETION_CHARS = DEFAULT_MAX_COMPLETION_CHARS  # kept for old imports
+
+_SHINGLE_CACHE_SIZE = 16     # distinct system prompts kept in memory
+_WARNED_MAX = 256
+_COMPLETION_WARN_EVERY_S = 60.0
+
+_shingle_cache: "OrderedDict[tuple[str, int, int], tuple[frozenset[int], bool]]" = OrderedDict()
+_shingle_lock = threading.Lock()
+_warned_prompts: "OrderedDict[str, None]" = OrderedDict()
+_last_completion_warning = 0.0
+
+
+@dataclass
+class LeakScanInfo:
+    """Result of a leak scan, including whether the scan was complete."""
+
+    spans: list[Span] = field(default_factory=list)
+    system_truncated: bool = False
+    completion_truncated: bool = False
+    system_chars: int = 0
+    completion_chars: int = 0
+
+    @property
+    def truncated(self) -> bool:
+        return self.system_truncated or self.completion_truncated
 
 
 def normalize_with_offsets(text: str) -> tuple[str, list[int], list[int]]:
@@ -210,50 +254,121 @@ def _tokenize(text: str) -> list[tuple[str, int, int]]:
     ]
 
 
+def _warn_system_truncated_once(digest: str, length: int, limit: int) -> None:
+    """Warn once per distinct system prompt. Logs lengths and a hash prefix,
+    never the prompt text."""
+    with _shingle_lock:
+        if digest in _warned_prompts:
+            return
+        _warned_prompts[digest] = None
+        while len(_warned_prompts) > _WARNED_MAX:
+            _warned_prompts.popitem(last=False)
+    logger.warning(
+        "System prompt exceeds output_scanner.max_system_chars: length=%d "
+        "limit=%d prompt_sha256=%s. Leaks from the part beyond the limit "
+        "will NOT be detected.",
+        length, limit, digest[:12],
+    )
+
+
+def _warn_completion_truncated(length: int, limit: int) -> None:
+    """Throttled warning (completions differ every request)."""
+    global _last_completion_warning
+    now = time.monotonic()
+    if now - _last_completion_warning < _COMPLETION_WARN_EVERY_S:
+        return
+    _last_completion_warning = now
+    logger.warning(
+        "Completion exceeds output_scanner.max_completion_chars: length=%d "
+        "limit=%d. Leaks beyond the limit will NOT be detected.",
+        length, limit,
+    )
+
+
+def _build_shingle_set(system_instruction: str, k: int, max_chars: int) -> tuple[frozenset[int], bool]:
+    truncated = len(system_instruction) > max_chars
+    words = [w for w, _, _ in _tokenize(system_instruction[:max_chars])]
+    if len(words) < k:
+        return frozenset(), truncated
+    # Store hashes, not tuples of words: much less memory for huge prompts.
+    return frozenset(hash(tuple(words[i : i + k])) for i in range(len(words) - k + 1)), truncated
+
+
+def _get_system_shingles(system_instruction: str, k: int, max_chars: int) -> tuple[frozenset[int], bool]:
+    """Return (shingle hashes, truncated), cached per system prompt."""
+    digest = hashlib.sha256(system_instruction.encode("utf-8", "replace")).hexdigest()
+    key = (digest, k, max_chars)
+
+    with _shingle_lock:
+        cached = _shingle_cache.get(key)
+        if cached is not None:
+            _shingle_cache.move_to_end(key)
+    if cached is None:
+        cached = _build_shingle_set(system_instruction, k, max_chars)  # slow part, outside the lock
+        with _shingle_lock:
+            _shingle_cache[key] = cached
+            while len(_shingle_cache) > _SHINGLE_CACHE_SIZE:
+                _shingle_cache.popitem(last=False)
+
+    if cached[1]:
+        _warn_system_truncated_once(digest, len(system_instruction), max_chars)
+    return cached
+
+
+def detect_system_prompt_leak_ex(
+    completion: str,
+    system_instruction: str,
+    min_words: int = 8,
+    max_system_chars: int | None = None,
+    max_completion_chars: int | None = None,
+) -> LeakScanInfo:
+    """Like detect_system_prompt_leak, but also reports truncation."""
+    sys_limit = MAX_SYSTEM_CHARS if max_system_chars is None else max_system_chars
+    comp_limit = MAX_COMPLETION_CHARS if max_completion_chars is None else max_completion_chars
+    info = LeakScanInfo(
+        system_chars=len(system_instruction or ""),
+        completion_chars=len(completion or ""),
+    )
+    if not completion or not system_instruction:
+        return info
+    k = max(1, int(min_words))
+
+    shingles, info.system_truncated = _get_system_shingles(system_instruction, k, sys_limit)
+    if not shingles:
+        return info
+
+    info.completion_truncated = len(completion) > comp_limit
+    if info.completion_truncated:
+        _warn_completion_truncated(len(completion), comp_limit)
+
+    tokens = _tokenize(completion[:comp_limit])
+    words = [w for w, _, _ in tokens]
+
+    spans: list[Span] = []
+    run_start = -1
+    run_end = -1
+    for i in range(len(words) - k + 1):
+        if hash(tuple(words[i : i + k])) not in shingles:
+            continue
+        if run_start >= 0 and i <= run_end + 1:
+            run_end = i + k - 1
+        else:
+            if run_start >= 0:
+                spans.append(Span(tokens[run_start][1], tokens[run_end][2], SYSTEM_PROMPT_LEAK))
+            run_start, run_end = i, i + k - 1
+    if run_start >= 0:
+        spans.append(Span(tokens[run_start][1], tokens[run_end][2], SYSTEM_PROMPT_LEAK))
+    info.spans = spans
+    return info
+
+
 def detect_system_prompt_leak(
     completion: str,
     system_instruction: str,
     min_words: int = 8,
 ) -> list[Span]:
-    """Find places where `completion` repeats the system instruction.
-
-    A leak is `min_words` or more consecutive words that appear in the same
-    order in the system instruction. Comparison ignores case, punctuation,
-    spacing and Unicode width/compatibility differences. Overlapping or
-    adjacent matches are merged into one span (category SYSTEM_PROMPT_LEAK)
-    with offsets in the original `completion`.
-
-    Cost: one pass over each text plus one hash lookup per completion word.
-    Returns [] when either input is empty or the system instruction has fewer
-    than `min_words` words.
-    """
-    if not completion or not system_instruction:
-        return []
-    k = max(1, int(min_words))
-
-    sys_words = [w for w, _, _ in _tokenize(system_instruction[:MAX_SYSTEM_CHARS])]
-    if len(sys_words) < k:
-        return []
-    shingles = {tuple(sys_words[i : i + k]) for i in range(len(sys_words) - k + 1)}
-
-    tokens = _tokenize(completion[:MAX_COMPLETION_CHARS])
-    words = [w for w, _, _ in tokens]
-
-    spans: list[Span] = []
-    run_start = -1  # first word index of the current leaked run
-    run_end = -1    # last word index of the current leaked run
-    for i in range(len(words) - k + 1):
-        if tuple(words[i : i + k]) not in shingles:
-            continue
-        if run_start >= 0 and i <= run_end + 1:  # overlaps or touches the run
-            run_end = i + k - 1
-        else:
-            if run_start >= 0:
-                spans.append(Span(start=tokens[run_start][1], end=tokens[run_end][2], category=SYSTEM_PROMPT_LEAK))
-            run_start, run_end = i, i + k - 1
-    if run_start >= 0:
-        spans.append(Span(start=tokens[run_start][1], end=tokens[run_end][2], category=SYSTEM_PROMPT_LEAK))
-    return spans
+    """Backward-compatible wrapper: spans only (contract signature unchanged)."""
+    return detect_system_prompt_leak_ex(completion, system_instruction, min_words).spans
 
 
 # ---------------------------------------------------------------------------
