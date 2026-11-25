@@ -248,6 +248,8 @@ def _build_app(monkeypatch, engine):
         from src.proxy import handler
     except ImportError as exc:
         pytest.skip(f"src.proxy.handler not importable: {exc}")
+    from src.proxy.admission import RequestAdmissionController
+    from src.engine.pipeline import PipelineConfig
 
     async def fake_forward(payload: dict) -> dict:
         return {"id": "perf", "choices": [{"message": {"role": "assistant", "content": "ok"}}]}
@@ -258,8 +260,29 @@ def _build_app(monkeypatch, engine):
     async def no_pii_rules(category: str = "PII") -> list:
         return []
 
+    async def no_ip_blocklist(client_ip, request_id, request, background_tasks):
+        return None
+
     monkeypatch.setattr(handler, "forward_to_llm", fake_forward, raising=False)
     monkeypatch.setattr(handler, "write_threat_log", fake_write_log, raising=False)
+    monkeypatch.setattr(handler, "_refuse_if_ip_blocked", no_ip_blocklist)
+    monkeypatch.setattr(
+        handler,
+        "admission_controller",
+        RequestAdmissionController(
+            requests_per_minute=60_000,
+            burst=PROXY_RUNS + WARMUP_RUNS,
+            max_in_flight=16,
+        ),
+    )
+    test_config = PipelineConfig(
+        layer_1_enabled=True,
+        layer_2_enabled=False,
+        layer_3_enabled=False,
+        output_scanner_enabled=False,
+    )
+    monkeypatch.setattr(handler, "get_pipeline_config", lambda: test_config)
+    monkeypatch.setattr(handler, "count_prompt_tokens", lambda text: 1)
 
     # Use the test engine (YAML rules, no database) wherever the global one is imported.
     for module_name in ("src.engine.layer_1_deterministic", "src.engine.pipeline", "src.proxy.handler"):
@@ -268,11 +291,13 @@ def _build_app(monkeypatch, engine):
         except ImportError:
             continue
         monkeypatch.setattr(module, "layer1_engine", engine, raising=False)
+        if module_name == "src.engine.pipeline":
+            monkeypatch.setattr(module, "get_pipeline_config", lambda: test_config)
     # Avoid any database call from the output scanner.
     try:
         from src.engine import output_scanner
 
-        monkeypatch.setattr(output_scanner, "get_active_output_scanner_rules", no_pii_rules, raising=False)
+        monkeypatch.setattr(output_scanner, "_load_active_pii_rules", no_pii_rules)
     except ImportError:
         pass
 

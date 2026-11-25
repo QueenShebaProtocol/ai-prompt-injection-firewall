@@ -74,6 +74,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       DASHBOARD_ADMIN_PASSWORD: ${DASHBOARD_ADMIN_PASSWORD:?Set DASHBOARD_ADMIN_PASSWORD in .env}
       FIREWALL_RUNTIME_CONFIG_PATH: /app/runtime/firewall.yaml
+      FIREWALL_STATUS_URL: http://gateway:8000/
     command: ["streamlit", "run", "src/dashboard/app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
     depends_on:
       db:

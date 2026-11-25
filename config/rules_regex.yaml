@@ -27,8 +27,8 @@ rules:
   - rule_id: RULE_SYSTEM_OVERRIDE_01
     rule_type: REGEX
     category: SYSTEM_OVERRIDE
-    pattern: '(?i)\b(ignore|disregard|forget|override)\s+(?:(?:all|any)\s+)?(?:the\s+)?(?:your\s+)?(?:previous|prior|above|earlier)\s+(instructions?|prompts?|rules?|directives?)\b(?!\s+(?:in|of|about|regarding|concerning)\s+(?!this\s+(?:conversation|chat|session)\b))'
-    description: Direct override - "ignore (all/any/the) previous/prior/above instructions"
+    pattern: '(?i)(?:\b(ignore|disregard|forget|override)\s+(?:(?:all|any)\s+)?(?:the\s+)?(?:your\s+)?(?:previous|prior|above|earlier)\s+(instructions?|prompts?|rules?|directives?)\b(?!\s+(?:in|of|about|regarding|concerning)\s+(?!this\s+(?:conversation|chat|session)\b))|\b(?:forget|ignore|disregard)\s+(?:everything|all(?:\s+of)?(?:\s+the)?)\s+(?:you\s+(?:were|have\s+been)\s+)?(?:told|instructed)\b|\b(?:from\s+now\s+on|starting\s+now)\s*,?\s*(?:follow|obey)\s+(?:only|exclusively)\s+my\s+(?:instructions?|commands?)\b|\b(?:my|these)\s+instructions?\s+(?:override|supersede|take\s+priority\s+over)\s+(?:the\s+)?(?:system|developer|previous|prior)\s+(?:instructions?|prompt|message)\b|\bignora\s+(?:todas?\s+)?las\s+instrucciones?\s+(?:anteriores|previas)\b|\bignore\s+(?:todas?\s+)?as\s+instruções\s+anteriores\b|\bignorez?\s+(?:toutes?\s+)?les\s+instructions?\s+(?:précédentes|antérieures)\b|\bignoriere\s+(?:alle\s+)?(?:vorherigen|früheren)\s+anweisungen\b|\bignora\s+(?:tutte\s+)?le\s+istruzioni\s+(?:precedenti|anteriori)\b|تجاهل\s+(?:كل|جميع)\s+(?:التعليمات|الأوامر)\s+(?:السابقة|الماضية)|(?:忽略|无视)(?:之前|前面)(?:的)?(?:所有|全部)(?:系统)?(?:指令|指示))'
+    description: Instruction overrides in English, Spanish, Portuguese, French, German, Italian, Arabic and Chinese
     severity: CRITICAL
     is_active: true
  
@@ -60,7 +60,7 @@ rules:
   - rule_id: RULE_JAILBREAK_01
     rule_type: REGEX
     category: JAILBREAK
-    pattern: '(?i)\bdo\s+anything\s+now\b|(?<!\bon\s)(?<!\babout\s)(?<!\bof\s)(?<!\bregarding\s)(?<!\bcalled\s)\bdan\s+mode\b|\bjailbroken\s+(mode|ai|version)\b'
+    pattern: '(?i)\bdo\s+anything\s+now\b|(?<!\bon\s)(?<!\babout\s)(?<!\bof\s)(?<!\bregarding\s)(?<!\bcalled\s)\bdan\s+mode\b|\bjailbroken\s+(mode|ai|version)\b|\b(?:act\s+as|pretend\s+(?:to\s+be|you\s+are)|role[\s-]?play\s+as|assume\s+(?:the\s+)?(?:role|persona)\s+of)\s+(?:an?\s+)?(?:DAN|jailbroken|unrestricted|uncensored|unfiltered|no[- ]rules?)\b|\byou\s+are\s+(?:now\s+)?(?:an?\s+)?(?:unrestricted|uncensored|unfiltered|jailbroken)\s+(?:assistant|AI|model)\b'
     description: DAN-style persona override ("Do Anything Now", "DAN mode")
     severity: HIGH
     is_active: true
@@ -68,7 +68,7 @@ rules:
   - rule_id: RULE_JAILBREAK_02
     rule_type: REGEX
     category: JAILBREAK
-    pattern: '(?i)(?:\byou\s+are\s+(?:now\s+)?in|(?:^|[.!?;:,]\s*|\b(?:please|now|and|then)\s+)simulate|\bpretend\s+(?:that\s+)?you\s+are\s+in|\bact\s+as\s+if\s+you\s+are\s+in)\s+(?:a\s+)?(?:developer|dev|god)\s+mode\b'
+    pattern: '(?i)(?:\b(?:you\s+are\s+(?:now\s+)?in|(?:^|[.!?;:,]\s*|\b(?:please|now|and|then)\s+)simulate|\bpretend\s+(?:that\s+)?you\s+are\s+in|\bact\s+as\s+if\s+you\s+are\s+in)\s+(?:a\s+)?(?:developer|dev|god)\s+mode\b|\b(?:enable|activate|enter|switch\s+to)\s+(?:your\s+)?(?:developer|dev|god)\s+mode\b(?=.{0,80}\b(?:answer|respond|assistant|unrestricted|uncensored|without\s+restrictions)\b)|\b(?:hypothetically|fictional(?:ly)?|imaginary|imagine|for\s+(?:a\s+)?(?:fictional\s+)?(?:story|role-?play|game))\b.{0,160}\b(?:you\s+(?:are|should\s+be|can\s+act\s+as)\s+(?:an?\s+)?(?:unrestricted|uncensored|unfiltered|jailbroken)|(?:ignore|disregard|bypass)\s+(?:all\s+)?(?:your\s+|the\s+)?(?:safety\s+)?(?:rules|restrictions|guidelines|instructions)|without\s+(?:any\s+)?(?:safety\s+)?(?:rules|restrictions|guidelines)|no\s+(?:safety\s+)?restrictions\s+(?:apply|in\s+this\s+(?:scenario|story)))\b)'
     description: Developer-mode / god-mode persona override
     severity: HIGH
     is_active: true

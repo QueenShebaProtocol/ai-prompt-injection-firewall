@@ -67,15 +67,18 @@ Your application keeps using its normal LLM SDK; only the base URL changes (see
 | Component | What it does |
 |---|---|
 | **Proxy** (`src/proxy/`) | Accepts `POST /v1/chat/completions`, runs the inspection, forwards cleared requests, returns a block response when denied. |
-| **Inspection pipeline** (`src/engine/pipeline.py`) | Cascade that stops at the first decision: **Layer 1** deterministic rules (regex and keywords, sub-millisecond) → **Layer 2** local ONNX classifier (risk score) → **Layer 3** local reasoning model, only for prompts Layer 2 is unsure about (allow, block or redact). |
-| **Output scanner** (`src/engine/output_scanner.py`) | Checks the model's answer for leaked system-prompt text, PII and secrets, then passes, redacts or blocks it. |
+| **Inspection pipeline** (`src/engine/pipeline.py`) | **Layer 1** deterministic rules (regex and keywords) → **Layer 2** local ONNX classifier (risk score) → **Layer 3** local reasoning model for uncertain prompts. If Layer 2 is disabled or unavailable, Layer 3 evaluates the prompt when enabled. Uncertain or unavailable Layer 2 results are blocked when Layer 3 is disabled. If both are deliberately disabled, Layer-1-clear prompts pass and the dashboard warns. |
+| **Output scanner** (`src/engine/output_scanner.py`) | Checks every returned choice for leaked system-prompt text, PII and secrets, then passes, redacts or blocks it. Warns once in the gateway log if a system instruction exceeds the scan limit. |
 | **Database** (`src/database/`) | PostgreSQL stores every decision, the rules, hourly metrics and audit records. Writes never slow a request down. |
 | **Dashboard** (`src/dashboard/`) | Streamlit app for analytics and log search. |
 | **ML assets** (`src/models/`) | The Layer 2 classifier and tokenizer, loaded from local disk. |
 
 Request lifecycle: the application sends a standard LLM request to the firewall →
-Layer 1 → Layer 2 → Layer 3 as needed → if cleared, forwarded to the provider → the
-completion is scanned → the answer is returned → the decision is logged to PostgreSQL.
+the firewall enforces `MAX_PROMPT_TOKENS` on the latest user message using Layer 2's
+tokenizer → Layer 1 checks the original and supported normalized/decoded text forms
+→ Layer 2 → Layer 3 as needed (or directly when Layer 2 is disabled/unavailable) →
+if cleared, forwarded to the provider → every completion choice is scanned → the
+answer is returned → the decision is logged to PostgreSQL.
 
 ## Requirements
 
@@ -231,6 +234,18 @@ curl http://<firewall-host>:8000/v1/chat/completions -H 'Content-Type: applicati
 | `config/firewall.yaml` | Which layers are on, Layer 2 thresholds, Layer 3 settings and prompt, output-scanner policy (`on_detect`: block, redact or warn). | Restart: `docker compose restart gateway` |
 | `config/rules_regex.yaml`, `config/deny_list.yaml` | Layer 1 rules and the output scanner's PII and secret patterns. | `scripts/seed_rules.py`, then picked up live |
 
+`MAX_PROMPT_TOKENS` defaults to `512` and must be positive and no greater than
+`L2_MAX_LENGTH`. It limits the latest user message—the same text Layer 1 and Layer 2
+inspect—using Layer 2's tokenizer, and rejects oversized prompts with HTTP `413`
+before inspection or forwarding. System instructions and earlier conversation turns
+are not included, so applications can retain their own system context and history
+limits. If token counting cannot be performed, the request fails closed with HTTP
+`503`. Layer 1 also checks URL-decoded, Base64-decoded, hex-decoded, ROT13, common
+leetspeak, NFKC-normalized, and invisible-character-stripped views; a Base64/hex-shaped
+blob of 256 characters or more is blocked for review.
+If a system instruction exceeds the output leak detector's 50,000-character scan
+window, the gateway emits a warning that its remainder was not checked.
+
 An invalid `firewall.yaml` stops the gateway from starting, with the reason in `docker compose logs gateway`.
 
 ## Running the tests
@@ -243,6 +258,50 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
+## Layer 1 jailbreak benchmark
+
+To measure deterministic rule matches against the MIT-licensed
+[JailbreakBench PAIR artifact](https://github.com/JailbreakBench/artifacts), run:
+
+```bash
+python scripts/benchmark_layer1_jbb.py
+```
+
+The script downloads a pinned dataset revision, prints aggregate counts only, and reports
+Layer 1's lexical detection rate plus matches in the local benign-prompt fixtures. This is
+not an end-to-end jailbreak-success rate or a guarantee of firewall effectiveness; it
+measures only whether the current deterministic rules match the artifact's prompts.
+
+## Load testing and overload policy
+
+The gateway applies a per-client-IP token bucket (defaults: 60 requests/minute, burst 20)
+and a process-wide in-flight request cap (default: 16). Rate-limited requests return
+HTTP `429` with `Retry-After`; requests arriving at capacity return HTTP `503` with
+`Retry-After`. Neither is forwarded to the model. These limits are configurable with
+`RATE_LIMIT_REQUESTS_PER_MINUTE`, `RATE_LIMIT_BURST`, and `MAX_IN_FLIGHT_REQUESTS` in
+`.env`. Docker Compose runs one gateway worker; multiple workers or replicas have
+independent in-memory limits, so production horizontal scaling needs a shared limiter
+or an API gateway.
+
+Layer 3 has a 10-second default timeout and `on_failure: block`; Layer 2 errors escalate
+to Layer 3, and inspection failures are blocked unless `FIREWALL_FAIL_OPEN=true` is
+explicitly enabled. Keep fail-open disabled for fail-closed behavior.
+
+Run synthetic measurements separately:
+
+```bash
+python scripts/load_test.py --component layer2 --requests 200 --concurrency 16
+python scripts/load_test.py --component layer3 --requests 50 --concurrency 8
+python scripts/load_test.py --component gateway --requests 100 --concurrency 16
+```
+
+The script reports p50/p95/p99/max latency, throughput, status counts and error rate,
+and saves JSON under `PERF_RESULTS_DIR` (default: `./perf_results`). Layer 3 mode calls
+the configured `LAYER3_BASE_URL`; use a test endpoint and synthetic prompts. Gateway
+mode sends a prompt expected to be blocked at Layer 1, so run it only against a test
+deployment with rules loaded. If the gateway is behind a reverse proxy, configure
+trusted proxy addresses rather than trusting arbitrary forwarded-IP headers.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
@@ -251,7 +310,7 @@ python -m pytest
 | `The "POSTGRES_PASSWORD" variable is not set` or `.env not found` | Run `cp .env.example .env` in the repository root, then edit it. |
 | `role "…" does not exist` or login fails after changing the credentials | Postgres only reads `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` when its volume is first created. Run `docker compose down -v` (this **deletes the stored logs**) and start again. |
 | Gateway keeps restarting | `docker compose logs gateway`. The usual cause is an invalid `config/firewall.yaml`; the log names the setting. |
-| Log says "Layer 2 unavailable, running on Layer 1 only" | The model files are missing from the image or `L2_MODEL_PATH` / `L2_TOKENIZER_DIR` are wrong. The firewall keeps working on Layer 1, but with less protection. |
+| Layer 2 model is unavailable | The model files are missing from the image or `L2_MODEL_PATH` / `L2_TOKENIZER_DIR` are wrong. Prompts go to Layer 3 when enabled; otherwise only Layer 1 rules inspect them. The dashboard warns when the system is degraded. |
 | `layer1_rules_loaded` is `0` in `GET /` and nothing is blocked | The rules were not loaded. Run `docker compose exec gateway python scripts/seed_rules.py`, then check the log for rule-loading errors. |
 | Clean requests return `502` or `504` | The provider is unreachable, rejects the key, or is too slow. Check `TARGET_LLM_BASE_URL`, `TARGET_LLM_API_KEY` and `DOWNSTREAM_TIMEOUT_SECONDS`. |
 | Requests return `503` `inspection_unavailable` | The inspection itself failed (see the gateway log). By design nothing is forwarded; set `FIREWALL_FAIL_OPEN=true` only if you accept uninspected traffic. |

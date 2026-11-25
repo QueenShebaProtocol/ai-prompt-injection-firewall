@@ -348,7 +348,7 @@ async def _run_layer2(prompt, context, cfg, layer_details) -> float | None:
     clf = get_classifier()
     if not clf.is_loaded:
         logger.warning("Layer 2 is enabled but the classifier is not loaded; "
-                       "continuing with Layer 1 only.")
+                       "escalating to Layer 3 when enabled.")
         layer_details["layer_2"] = {"status": "unavailable", "reason": "model_not_loaded"}
         return None
 
@@ -356,11 +356,11 @@ async def _run_layer2(prompt, context, cfg, layer_details) -> float | None:
     try:
         res = await clf.predict_async(text)
     except ClassifierUnavailable as exc:
-        logger.warning("Layer 2 failed (%s); continuing with Layer 1 only.", exc)
+        logger.warning("Layer 2 failed (%s); escalating to Layer 3 when enabled.", exc)
         layer_details["layer_2"] = {"status": "error", "reason": str(exc)}
         return None
     except Exception:
-        logger.exception("Unexpected Layer 2 error; continuing with Layer 1 only.")
+        logger.exception("Unexpected Layer 2 error; escalating to Layer 3 when enabled.")
         layer_details["layer_2"] = {"status": "error", "reason": "unexpected_error"}
         return None
 
@@ -382,18 +382,32 @@ async def _escalate_to_layer3(
     system_instruction: str,
     context,
     cfg: PipelineConfig,
-    score: float,
+    score: float | None,
     request_id: str,
     start: float,
     layer_details: dict,
 ) -> PipelineResult:
-    """Layer 2 was unsure: let the Layer 3 judge decide (or skip it if disabled).
+    """Escalate uncertain, unavailable, or disabled Layer 2 results to Layer 3.
 
     Fails closed: a REDACT with nothing to forward, or a decision we do not
     recognise, becomes a BLOCK.
     """
     if not cfg.layer_3_enabled:
         layer_details["layer_3"] = {"status": "disabled"}
+        if cfg.layer_2_enabled:
+            reason = "layer_2_unavailable" if score is None else "layer_2_uncertain"
+            layer_details["layer_3"]["reason"] = reason
+            logger.warning(
+                "Blocking request %s because Layer 3 is disabled and Layer 2 is %s.",
+                request_id,
+                "unavailable" if score is None else "uncertain",
+            )
+            return PipelineResult(
+                request_id=request_id, is_blocked=True, action_taken="BLOCKED",
+                triggered_layer="LAYER_2", risk_score=score, layer2_score=score,
+                execution_time_ms=_ms_since(start), layer_details=layer_details,
+                decision="BLOCK",
+            )
         return PipelineResult(
             request_id=request_id, is_blocked=False, action_taken="PASSED",
             triggered_layer="NONE", risk_score=score, layer2_score=score,
@@ -482,12 +496,19 @@ async def run_pipeline(
     score = None
     if cfg.layer_2_enabled:
         score = await _run_layer2(prompt, context, cfg, layer_details)
+    else:
+        layer_details["layer_2"] = {"status": "disabled"}
 
-    if score is None:                       
-        return PipelineResult(
-            request_id=request_id, is_blocked=False, action_taken="PASSED",
-            triggered_layer="NONE", risk_score=0.0, execution_time_ms=_ms_since(start),
-            layer_details=layer_details, decision="PASS",
+    if score is None:
+        return await _escalate_to_layer3(
+            prompt,
+            system_instruction,
+            context,
+            cfg,
+            score,
+            request_id,
+            start,
+            layer_details,
         )
 
     decision = _decide(score, cfg)

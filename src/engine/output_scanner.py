@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import logging
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -142,6 +143,21 @@ SYSTEM_PROMPT_LEAK = "SYSTEM_PROMPT_LEAK"
 # Only the first MAX_SYSTEM_CHARS characters of the system instruction are used.
 MAX_COMPLETION_CHARS = 20_000
 MAX_SYSTEM_CHARS = 50_000
+_system_truncation_warning_lock = threading.Lock()
+_system_truncation_warning_emitted = False
+
+
+def _warn_system_prompt_truncated() -> None:
+    global _system_truncation_warning_emitted
+    with _system_truncation_warning_lock:
+        if _system_truncation_warning_emitted:
+            return
+        _system_truncation_warning_emitted = True
+    logger.warning(
+        "System instruction exceeds the output leak scanner limit of %d characters; "
+        "its remainder is not checked.",
+        MAX_SYSTEM_CHARS,
+    )
 
 
 def normalize_with_offsets(text: str) -> tuple[str, list[int], list[int]]:
@@ -229,6 +245,8 @@ def detect_system_prompt_leak(
     """
     if not completion or not system_instruction:
         return []
+    if len(system_instruction) > MAX_SYSTEM_CHARS:
+        _warn_system_prompt_truncated()
     k = max(1, int(min_words))
 
     sys_words = [w for w, _, _ in _tokenize(system_instruction[:MAX_SYSTEM_CHARS])]

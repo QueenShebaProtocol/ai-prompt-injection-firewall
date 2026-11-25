@@ -360,6 +360,7 @@ import logging
 import asyncio
 import os
 import time
+from functools import wraps
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Request
@@ -367,8 +368,10 @@ from fastapi.responses import JSONResponse
 
 from src.database.storage import get_blocked_ips, normalize_client_ip, write_threat_log
 from src.engine import output_scanner
-from src.engine.output_scanner import OutputScanResult, redact_completion_payload
+from src.engine.output_scanner import OutputScanResult, Span, redact_completion_payload
+from src.engine.layer_2_classifier import count_prompt_tokens
 from src.engine.pipeline import PipelineResult, get_pipeline_config, new_request_id, run_pipeline
+from src.proxy.admission import RequestAdmissionController
 from src.proxy.forwarder import forward_to_llm
 
 logger = logging.getLogger("firewall.handler")
@@ -377,6 +380,7 @@ router = APIRouter()
 
 REQUEST_ID_HEADER = "X-Firewall-Request-Id"
 ACTION_HEADER = "X-Firewall-Action"
+admission_controller = RequestAdmissionController.from_environment()
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +432,57 @@ def _extract_prompt_and_system(body: dict) -> tuple[str, str]:
     return prompt, "\n".join(system_parts)
 
 
+def _prompt_text(body: dict) -> str:
+    """Return the latest user prompt, matching the text inspected by the pipeline."""
+    prompt, _ = _extract_prompt_and_system(body)
+    return prompt
+
+
+def _configured_prompt_token_limit() -> int:
+    """Use a prompt cap no larger than Layer 2's maximum sequence length."""
+    try:
+        layer2_max = int(os.getenv("L2_MAX_LENGTH", "512"))
+        limit = int(os.getenv("MAX_PROMPT_TOKENS", str(layer2_max)))
+    except ValueError as exc:
+        raise ValueError("L2_MAX_LENGTH and MAX_PROMPT_TOKENS must be integers") from exc
+    if layer2_max < 1 or limit < 1 or limit > layer2_max:
+        raise ValueError(
+            "MAX_PROMPT_TOKENS must be positive and no greater than L2_MAX_LENGTH"
+        )
+    return limit
+
+
+async def _check_prompt_token_limit(
+    body: dict, request_id: str
+) -> JSONResponse | None:
+    try:
+        limit = _configured_prompt_token_limit()
+        token_count = await asyncio.to_thread(count_prompt_tokens, _prompt_text(body))
+    except Exception:
+        logger.exception("Could not enforce prompt token limit for request_id=%s", request_id)
+        return _error(
+            503,
+            "firewall_error",
+            "prompt_limit_unavailable",
+            "The request size could not be validated. Please try again later.",
+            request_id,
+            action="BLOCKED",
+        )
+
+    if token_count > limit:
+        return _error(
+            413,
+            "request_too_large",
+            "prompt_too_long",
+            f"The user prompt exceeds the configured limit of {limit} tokens.",
+            request_id,
+            action="BLOCKED",
+            max_tokens=limit,
+            actual_tokens=token_count,
+        )
+    return None
+
+
 def _replace_text_content(content, new_text: str):
     """String content -> the new string. List of parts -> the first text part
     carries the new text, other text parts are dropped (the sanitized prompt
@@ -462,29 +517,51 @@ def _build_sanitized_body(body: dict, sanitized_prompt: str) -> dict:
     return new_body
 
 
-def _completion_text(completion) -> str:
-    """Text of choices[0].message.content, or "" when there is none."""
+def _completion_texts(completion) -> dict[int, str]:
+    """Text content for every OpenAI-style completion choice."""
     if not isinstance(completion, dict):
-        return ""
+        return {}
     choices = completion.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return ""
-    first = choices[0]
-    message = first.get("message") if isinstance(first, dict) else None
-    content = message.get("content") if isinstance(message, dict) else None
-    return content if isinstance(content, str) else ""
+    if not isinstance(choices, list):
+        return {}
+    texts = {}
+    for index, choice in enumerate(choices):
+        message = choice.get("message") if isinstance(choice, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str) and content:
+            texts[index] = content
+    return texts
 
 
 async def _scan_completion(
     completion: dict, system_instruction: str, request_id: str
-) -> OutputScanResult:
-    text = _completion_text(completion)
-    if not text:
-        return OutputScanResult()  
-    scan = output_scanner.scan_output(text, system_instruction, request_id)
-    if inspect.isawaitable(scan): 
-        scan = await scan
-    return scan
+) -> tuple[OutputScanResult, dict[int, list[Span]]]:
+    spans_by_choice: dict[int, list[Span]] = {}
+    scans: list[OutputScanResult] = []
+    for index, text in _completion_texts(completion).items():
+        scan = output_scanner.scan_output(text, system_instruction, request_id)
+        if inspect.isawaitable(scan):
+            scan = await scan
+        scans.append(scan)
+        if scan.spans:
+            spans_by_choice[index] = scan.spans
+
+    flagged_scans = [scan for scan in scans if scan.flagged]
+    categories = sorted({
+        category
+        for scan in flagged_scans
+        for category in scan.categories
+    })
+    action = flagged_scans[0].action if flagged_scans else "PASS"
+    return (
+        OutputScanResult(
+            flagged=bool(flagged_scans),
+            categories=categories,
+            spans=[span for scan in flagged_scans for span in scan.spans],
+            action=action,
+        ),
+        spans_by_choice,
+    )
 
 
 
@@ -521,6 +598,7 @@ def _error(
     request_id: str,
     *,
     action: str | None = None,
+    extra_headers: dict[str, str] | None = None,
     **extra,
 ) -> JSONResponse:
     error = {
@@ -530,7 +608,50 @@ def _error(
         "request_id": request_id,
     }
     error.update(extra)
-    return _respond(status_code, {"error": error}, request_id, action)
+    return _respond(
+        status_code,
+        {"error": error},
+        request_id,
+        action,
+        extra_headers=extra_headers,
+    )
+
+
+def _with_request_admission(endpoint):
+    @wraps(endpoint)
+    async def wrapper(request: Request, background_tasks: BackgroundTasks):
+        request_id = new_request_id()
+        client_ip = request.client.host if request.client else "unknown"
+        retry_after = admission_controller.consume_token(client_ip)
+        if retry_after is not None:
+            return _error(
+                429,
+                "rate_limit_exceeded",
+                "rate_limit_exceeded",
+                "Too many requests from this client. Please retry later.",
+                request_id,
+                action="BLOCKED",
+                extra_headers={"Retry-After": str(retry_after)},
+                retry_after=retry_after,
+            )
+
+        if not admission_controller.try_acquire():
+            return _error(
+                503,
+                "service_unavailable",
+                "server_overloaded",
+                "The firewall is at capacity. Please retry shortly.",
+                request_id,
+                action="BLOCKED",
+                extra_headers={"Retry-After": "1"},
+            )
+
+        try:
+            return await endpoint(request, background_tasks)
+        finally:
+            admission_controller.release()
+
+    return wrapper
 
 
 def _validate_body(body) -> tuple[str, str] | None:
@@ -694,6 +815,7 @@ async def healthz() -> dict:
 
 
 @router.post("/v1/chat/completions")
+@_with_request_admission
 async def chat_completions(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -724,6 +846,11 @@ async def chat_completions(
     blocked_response = await _refuse_if_ip_blocked(client_ip, request_id, request, background_tasks)
     if blocked_response is not None:
         return blocked_response
+
+    size_error = await _check_prompt_token_limit(body, request_id)
+    if size_error is not None:
+        return size_error
+
     application_id = request.headers.get("X-Application-Id", "unknown")
     target_model = body.get("model") or "unknown"
 
@@ -914,9 +1041,11 @@ async def chat_completions(
 
 
     try:
-        scan = await _scan_completion(completion, system_instruction, request_id)
+        scan, spans_by_choice = await _scan_completion(
+            completion, system_instruction, request_id
+        )
         if scan.action == "REDACT":
-            completion = redact_completion_payload(completion, {0: scan.spans})
+            completion = redact_completion_payload(completion, spans_by_choice)
     except Exception:
         logger.exception("Output scanner failure for request_id=%s", request_id)
 
