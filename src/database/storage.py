@@ -26,6 +26,8 @@ Functions in this file:
 """
 
 import asyncio
+import atexit
+import os
 import ipaddress
 import re
 import copy
@@ -100,11 +102,7 @@ async def get_active_layer1_rules() -> list[dict]:
         stmt = (
             select(FirewallRule)
             .where(FirewallRule.is_active.is_(True))
-            .where(
-                FirewallRule.rule_type.in_(
-                    ["REGEX", "KEYWORD", "EXCLUSION"]
-                )
-            )
+            .where(FirewallRule.rule_type.in_(["REGEX", "KEYWORD", "EXCLUSION"]))
             .order_by(FirewallRule.rule_id)
         )
 
@@ -113,12 +111,12 @@ async def get_active_layer1_rules() -> list[dict]:
 
         return [
             {
-                "rule_id":     r.rule_id,
-                "rule_type":   r.rule_type,
-                "category":    r.category,
-                "pattern":     r.pattern,
+                "rule_id": r.rule_id,
+                "rule_type": r.rule_type,
+                "category": r.category,
+                "pattern": r.pattern,
                 "description": r.description,
-                "severity":    r.severity,
+                "severity": r.severity,
             }
             for r in rows
         ]
@@ -193,13 +191,9 @@ async def compute_bucket(bucket_start: datetime) -> dict:
     async with AsyncSessionLocal() as session:
         stmt = select(
             func.count().label("total_requests"),
-
             func.count()
-            .filter(
-                ThreatLog.is_blocked.is_(True)
-            )
+            .filter(ThreatLog.is_blocked.is_(True))
             .label("blocked_requests"),
-
             func.count()
             .filter(
                 and_(
@@ -208,7 +202,6 @@ async def compute_bucket(bucket_start: datetime) -> dict:
                 )
             )
             .label("layer_1_blocks"),
-
             func.count()
             .filter(
                 and_(
@@ -217,7 +210,6 @@ async def compute_bucket(bucket_start: datetime) -> dict:
                 )
             )
             .label("layer_2_blocks"),
-
             func.count()
             .filter(
                 and_(
@@ -226,7 +218,6 @@ async def compute_bucket(bucket_start: datetime) -> dict:
                 )
             )
             .label("layer_3_blocks"),
-
             func.count()
             .filter(
                 and_(
@@ -235,19 +226,14 @@ async def compute_bucket(bucket_start: datetime) -> dict:
                 )
             )
             .label("output_blocks"),
-
             func.coalesce(
                 func.avg(ThreatLog.execution_time_ms),
                 0.0,
             ).label("avg_latency_ms"),
-
             func.coalesce(
-                func.percentile_cont(0.95).within_group(
-                    ThreatLog.execution_time_ms
-                ),
+                func.percentile_cont(0.95).within_group(ThreatLog.execution_time_ms),
                 0.0,
             ).label("p95_latency_ms"),
-
         ).where(
             ThreatLog.created_at >= bucket_start,
             ThreatLog.created_at < bucket_end,
@@ -277,9 +263,7 @@ async def upsert_bucket(row: dict) -> None:
         stmt = pg_insert(SystemMetric).values(**row)
 
         update_cols = {
-            column: stmt.excluded[column]
-            for column in row
-            if column != "bucket_start"
+            column: stmt.excluded[column] for column in row if column != "bucket_start"
         }
 
         stmt = stmt.on_conflict_do_update(
@@ -305,9 +289,7 @@ async def rollup_recent_hours(hours: int = 3) -> int:
     if hours <= 0:
         return 0
 
-    current_bucket = _floor_to_hour(
-        datetime.now(timezone.utc)
-    )
+    current_bucket = _floor_to_hour(datetime.now(timezone.utc))
 
     written = 0
 
@@ -334,9 +316,7 @@ async def backfill(since: datetime) -> int:
     """
     bucket_start = _floor_to_hour(since)
 
-    current_bucket = _floor_to_hour(
-        datetime.now(timezone.utc)
-    )
+    current_bucket = _floor_to_hour(datetime.now(timezone.utc))
 
     written = 0
 
@@ -418,16 +398,10 @@ def _json_safe(value: Any) -> Any:
         return value.isoformat()
 
     if isinstance(value, Mapping):
-        return {
-            str(key): _json_safe(item)
-            for key, item in value.items()
-        }
+        return {str(key): _json_safe(item) for key, item in value.items()}
 
     if isinstance(value, (list, tuple, set)):
-        return [
-            _json_safe(item)
-            for item in value
-        ]
+        return [_json_safe(item) for item in value]
 
     # SQLAlchemy/other model objects should not be serialized blindly.
     # Convert unknown values to their string representation rather than
@@ -583,7 +557,6 @@ async def write_audit_log(
     )
 
 
-
 # --- Dashboard data layer (Week 2 Fri, P5) ----------------------------
 #
 # The Streamlit dashboard is synchronous, but the database code is async.
@@ -592,7 +565,7 @@ async def write_audit_log(
 
 MAX_PAGE_SIZE = 200
 DEFAULT_PAGE_SIZE = 50
-RECENT_HOURS_LIMIT = 48          # <= 48h: read threat_logs, > 48h: read system_metrics
+RECENT_HOURS_LIMIT = 48  # <= 48h: read threat_logs, > 48h: read system_metrics
 PROMPT_PREVIEW_CHARS = 200
 
 _VALID_LAYERS = {"NONE", "LAYER_1", "LAYER_2", "LAYER_3", "OUTPUT_SCANNER"}
@@ -609,41 +582,110 @@ _BUCKET_SQL = {
 
 
 # --- 1. run_sync: one long-lived background event loop ----------------
+#
+# Why one loop: asyncpg connections (and so SQLAlchemy's pool) belong to the
+# event loop that created them. Streamlit runs each user's page in its own
+# thread, so every thread must hand its coroutine to the SAME loop. Calling
+# asyncio.run() per request would build a new loop each time and break the
+# pool with "attached to a different loop". One loop does not serialise
+# queries: while one waits for PostgreSQL, the loop serves the others.
+#
+# Lifecycle: the loop and the engine's pool live and die together.
+# shutdown_storage() disposes the engine ON this loop, then stops it.
 _loop: asyncio.AbstractEventLoop | None = None
+_loop_thread: threading.Thread | None = None
 _loop_lock = threading.Lock()
+_LOOP_START_TIMEOUT_S = 5.0
+
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# Chosen on purpose: below SQLAlchemy's default pool_timeout (30 s), so a stuck
+# call reports OUR TimeoutError, and short enough that a Streamlit page does not
+# hang for half a minute. Heavy callers (CSV export) pass a larger timeout.
+DEFAULT_RUN_SYNC_TIMEOUT_S = _env_seconds("DASHBOARD_DB_TIMEOUT_S", 20.0)
+
+
+def _discard_stale_pool() -> bool:
+    """Drop the connection pool WITHOUT closing its connections.
+
+    Used only when the background loop died: the old connections belong to the
+    dead loop and cannot be closed from a new one. Returns True on success.
+    """
+    try:
+        from src.database.connection import engine
+
+        engine.sync_engine.dispose(close=False)
+        return True
+    except Exception:
+        logger.error("Could not discard the old connection pool", exc_info=True)
+        return False
 
 
 def _get_background_loop() -> asyncio.AbstractEventLoop:
-    """Start (once) a dedicated thread that runs one event loop forever.
+    """Start (once) a dedicated thread that runs one event loop forever."""
+    global _loop, _loop_thread
 
-    asyncpg connections belong to the loop they were created on, so every
-    dashboard query must run on this same loop.
-    """
-    global _loop
+    loop = _loop
+    if loop is not None and loop.is_running():
+        return loop  # fast path, no lock
+
     with _loop_lock:
         if _loop is not None and _loop.is_running():
-            return _loop
+            return _loop  # another thread created it while we waited
 
-        loop = asyncio.new_event_loop()
+        if _loop is not None:
+            # The loop died. Calls that were waiting on it will time out.
+            # Only replace it if the pool bound to the old loop can be reset;
+            # otherwise every query would fail with "different loop" errors.
+            logger.error("The storage event loop stopped unexpectedly.")
+            if not _discard_stale_pool():
+                raise RuntimeError(
+                    "The storage event loop stopped and its connection pool "
+                    "could not be reset. Restart the dashboard."
+                )
+
+        new_loop = asyncio.new_event_loop()
         started = threading.Event()
 
         def _run() -> None:
-            asyncio.set_event_loop(loop)
-            loop.call_soon(started.set)
-            loop.run_forever()
+            asyncio.set_event_loop(new_loop)
+            new_loop.call_soon(started.set)
+            try:
+                new_loop.run_forever()
+            except Exception:
+                logger.exception("The storage event loop crashed")
 
-        threading.Thread(target=_run, name="storage-event-loop", daemon=True).start()
-        started.wait()
-        _loop = loop
-        return _loop
+        thread = threading.Thread(target=_run, name="storage-event-loop", daemon=True)
+        thread.start()
+        if not started.wait(_LOOP_START_TIMEOUT_S):
+            raise RuntimeError("The storage event loop did not start in time")
+        _loop, _loop_thread = new_loop, thread
+        return new_loop
 
 
-def run_sync(coro, timeout: float = 30.0) -> Any:
+def run_sync(coro, timeout: float | None = None) -> Any:
     """Run an async coroutine from synchronous code (Streamlit) and return its result.
 
     Usage:  kpis = run_sync(get_kpi_summary(24))
+    Every call, from every thread, runs on the one background loop.
+    `timeout` defaults to DEFAULT_RUN_SYNC_TIMEOUT_S (env DASHBOARD_DB_TIMEOUT_S);
+    pass a larger value for heavy calls such as export_threat_logs.
     Do not call this from inside async code; use `await` there.
     """
+    if not asyncio.iscoroutine(coro):
+        raise TypeError(
+            "run_sync() expects a coroutine, e.g. run_sync(get_kpi_summary(24))"
+        )
+    if timeout is None:
+        timeout = DEFAULT_RUN_SYNC_TIMEOUT_S
+
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -654,13 +696,55 @@ def run_sync(coro, timeout: float = 30.0) -> Any:
             "run_sync() cannot be called from a running event loop; use await instead."
         )
 
-    loop = _get_background_loop()
+    try:
+        loop = _get_background_loop()
+    except Exception:
+        coro.close()  # avoid a "coroutine was never awaited" warning
+        raise
+
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     try:
         return future.result(timeout=timeout)
     except FutureTimeout:
         future.cancel()
-        raise TimeoutError(f"Database call did not finish within {timeout} seconds")
+        raise TimeoutError(
+            f"Database call did not finish within {timeout} seconds"
+        ) from None
+
+
+def shutdown_storage(timeout: float = 5.0) -> None:
+    """Dispose the engine ON the background loop, then stop the loop.
+
+    Safe to call when run_sync() was never used (then it does nothing). A later
+    run_sync() call starts a fresh loop. Registered with atexit.
+    """
+    global _loop, _loop_thread
+    with _loop_lock:
+        loop, thread = _loop, _loop_thread
+        _loop, _loop_thread = None, None
+
+    if loop is None or not loop.is_running():
+        return
+    try:
+        from src.database.connection import engine
+
+        asyncio.run_coroutine_threadsafe(engine.dispose(), loop).result(timeout)
+    except Exception:
+        logger.warning("Engine dispose failed during shutdown", exc_info=True)
+    loop.call_soon_threadsafe(loop.stop)
+    if thread is not None:
+        thread.join(timeout)
+
+
+atexit.register(shutdown_storage)
+
+
+async def ping_database() -> bool:
+    """True if the database answers. The dashboard calls this through run_sync()
+    so it never touches the engine or an event loop directly."""
+    from src.database.connection import check_database_connection
+
+    return await check_database_connection()
 
 
 # --- 2. ttl_cache: remember results for a few seconds -----------------
@@ -718,15 +802,17 @@ def ttl_cache(seconds: float, maxsize: int = 128):
 class LogFilters:
     """Search filters for threat_logs. Every field is optional (None = no filter)."""
 
-    start: datetime | None = None          # created_at >= start
-    end: datetime | None = None            # created_at <  end
+    start: datetime | None = None  # created_at >= start
+    end: datetime | None = None  # created_at <  end
     is_blocked: bool | None = None
-    triggered_layer: str | None = None     # NONE | LAYER_1 | LAYER_2 | LAYER_3 | OUTPUT_SCANNER
+    triggered_layer: str | None = (
+        None  # NONE | LAYER_1 | LAYER_2 | LAYER_3 | OUTPUT_SCANNER
+    )
     client_ip: str | None = None
-    min_risk: float | None = None          # risk_score >= min_risk
-    text: str | None = None                # case-insensitive "contains" on raw_prompt
-    bypassed_only: bool | None = None      # filter for firewall-master-OFF bypass records
-    action_taken: str | None = None        # PASSED | BLOCKED | REDACTED (exact match)
+    min_risk: float | None = None  # risk_score >= min_risk
+    text: str | None = None  # case-insensitive "contains" on raw_prompt
+    bypassed_only: bool | None = None  # filter for firewall-master-OFF bypass records
+    action_taken: str | None = None  # PASSED | BLOCKED | REDACTED (exact match)
 
 
 @dataclass
@@ -776,7 +862,9 @@ def _apply_filters(stmt, f: LogFilters | None):
         )
     if f.bypassed_only:
         stmt = stmt.where(
-            ThreatLog.layer_details.op("@>")(text('\'{"firewall_master": "OFF"}\'::jsonb'))
+            ThreatLog.layer_details.op("@>")(
+                text('\'{"firewall_master": "OFF"}\'::jsonb')
+            )
         )
     return stmt
 
@@ -791,7 +879,9 @@ async def get_kpi_summary(hours: int = 24, offset_hours: int = 0) -> dict:
     from safe inspection metrics: Safe = Total - Blocked - Bypassed.
     """
     start, end = _window(hours, offset_hours)
-    bypassed_filter = ThreatLog.layer_details.op("@>")(text('\'{"firewall_master": "OFF"}\'::jsonb'))
+    bypassed_filter = ThreatLog.layer_details.op("@>")(
+        text('\'{"firewall_master": "OFF"}\'::jsonb')
+    )
     stmt = select(
         func.count().label("total"),
         func.count().filter(ThreatLog.is_blocked.is_(True)).label("blocked"),
@@ -815,7 +905,9 @@ async def get_kpi_summary(hours: int = 24, offset_hours: int = 0) -> dict:
         "blocked_requests": blocked,
         "bypassed_requests": bypassed,
         "safe_requests": safe,
-        "block_rate": (blocked / inspected) if inspected else 0.0,   # 0.0 - 1.0 of inspected traffic
+        "block_rate": (
+            (blocked / inspected) if inspected else 0.0
+        ),  # 0.0 - 1.0 of inspected traffic
         "avg_latency_ms": float(row.avg_latency or 0.0),
         "p95_latency_ms": float(row.p95_latency or 0.0),
         "hours": max(1, int(hours)),
@@ -842,7 +934,9 @@ async def get_timeseries(hours: int = 24, bucket: str = "hour") -> list[dict]:
             select(
                 bucket_expr.label("bucket_start"),
                 func.count().label("total_requests"),
-                func.count().filter(ThreatLog.is_blocked.is_(True)).label("blocked_requests"),
+                func.count()
+                .filter(ThreatLog.is_blocked.is_(True))
+                .label("blocked_requests"),
             )
             .where(ThreatLog.created_at >= start)
             .group_by(bucket_expr)
@@ -854,8 +948,12 @@ async def get_timeseries(hours: int = 24, bucket: str = "hour") -> list[dict]:
         stmt = (
             select(
                 bucket_expr.label("bucket_start"),
-                func.coalesce(func.sum(SystemMetric.total_requests), 0).label("total_requests"),
-                func.coalesce(func.sum(SystemMetric.blocked_requests), 0).label("blocked_requests"),
+                func.coalesce(func.sum(SystemMetric.total_requests), 0).label(
+                    "total_requests"
+                ),
+                func.coalesce(func.sum(SystemMetric.blocked_requests), 0).label(
+                    "blocked_requests"
+                ),
             )
             .where(SystemMetric.bucket_start >= start)
             .group_by(bucket_expr)
@@ -919,7 +1017,9 @@ async def search_threat_logs(
             ThreatLog.risk_score,
             ThreatLog.output_flagged,
             # only the first characters, so huge prompts are not loaded for the table
-            func.left(ThreatLog.raw_prompt, PROMPT_PREVIEW_CHARS).label("prompt_preview"),
+            func.left(ThreatLog.raw_prompt, PROMPT_PREVIEW_CHARS).label(
+                "prompt_preview"
+            ),
         ),
         filters,
     )
@@ -986,6 +1086,7 @@ async def get_active_output_scanner_rules(category: str = "PII") -> list[dict]:
         for r in rules
     ]
 
+
 # =============================================================================
 # Week 3 Monday (P5) - more dashboard queries, export, and rule management
 # =============================================================================
@@ -1045,8 +1146,7 @@ async def get_risk_score_histogram(hours: int = 24, bins: int = 10) -> list[dict
     ]
 
 
-_TOP_PATTERNS_SQL = text(
-    """
+_TOP_PATTERNS_SQL = text("""
     SELECT p.pattern AS pattern, COUNT(*) AS hits
     FROM threat_logs AS t
     CROSS JOIN LATERAL jsonb_array_elements_text(t.detected_patterns) AS p(pattern)
@@ -1056,8 +1156,7 @@ _TOP_PATTERNS_SQL = text(
     GROUP BY p.pattern
     ORDER BY hits DESC, p.pattern
     LIMIT :limit
-    """
-)
+    """)
 
 
 @ttl_cache(30)
@@ -1077,7 +1176,9 @@ async def get_top_client_ips(hours: int = 24, limit: int = 10) -> list[dict]:
     """
     start, end = _window(hours)
     total = func.count().label("total_requests")
-    blocked = func.count().filter(ThreatLog.is_blocked.is_(True)).label("blocked_requests")
+    blocked = (
+        func.count().filter(ThreatLog.is_blocked.is_(True)).label("blocked_requests")
+    )
     stmt = (
         select(ThreatLog.client_ip, total, blocked)
         .where(ThreatLog.created_at >= start, ThreatLog.created_at < end)
@@ -1192,7 +1293,9 @@ async def export_threat_logs(
         ),
         filters,
     )
-    stmt = stmt.order_by(ThreatLog.created_at.desc(), ThreatLog.id.desc()).limit(max_rows)
+    stmt = stmt.order_by(ThreatLog.created_at.desc(), ThreatLog.id.desc()).limit(
+        max_rows
+    )
 
     async with AsyncSessionLocal() as session:
         rows = (await session.execute(stmt)).mappings().all()
@@ -1214,10 +1317,21 @@ class RuleNotFoundError(LookupError):
 
 _REQUIRED_RULE_FIELDS = ("rule_id", "rule_type", "category", "pattern", "severity")
 _UPDATABLE_RULE_FIELDS = (
-    "rule_type", "category", "pattern", "description", "severity", "is_active",
+    "rule_type",
+    "category",
+    "pattern",
+    "description",
+    "severity",
+    "is_active",
 )
 _SNAPSHOT_FIELDS = (
-    "rule_id", "rule_type", "category", "pattern", "description", "severity", "is_active",
+    "rule_id",
+    "rule_type",
+    "category",
+    "pattern",
+    "description",
+    "severity",
+    "is_active",
 )
 _ENUM_RULE_FIELDS = {
     "rule_type": _VALID_RULE_TYPES,
@@ -1274,7 +1388,9 @@ def _validate_rule(rule: Mapping[str, Any]) -> None:
     if not isinstance(pattern, str) or not pattern.strip():
         raise RuleValidationError("pattern must not be empty")
     if len(pattern) > MAX_PATTERN_CHARS:
-        raise RuleValidationError(f"pattern is longer than {MAX_PATTERN_CHARS} characters")
+        raise RuleValidationError(
+            f"pattern is longer than {MAX_PATTERN_CHARS} characters"
+        )
     if rule["rule_type"] == "REGEX":
         try:
             re.compile(pattern)
@@ -1290,7 +1406,9 @@ def _prepare_new_rule(rule: Mapping[str, Any]) -> dict:
     missing = [k for k in _REQUIRED_RULE_FIELDS if k not in rule]
     if missing:
         raise RuleValidationError(f"Missing required fields: {', '.join(missing)}")
-    unknown = sorted(set(rule) - set(_REQUIRED_RULE_FIELDS) - {"description", "is_active"})
+    unknown = sorted(
+        set(rule) - set(_REQUIRED_RULE_FIELDS) - {"description", "is_active"}
+    )
     if unknown:
         raise RuleValidationError(f"Unknown fields: {', '.join(unknown)}")
     data = {name: _clean_rule_value(name, value) for name, value in rule.items()}
@@ -1379,11 +1497,15 @@ async def create_rule(rule: Mapping[str, Any], admin_user: str) -> dict:
         try:
             exists = (
                 await session.execute(
-                    select(FirewallRule.id).where(FirewallRule.rule_id == data["rule_id"])
+                    select(FirewallRule.id).where(
+                        FirewallRule.rule_id == data["rule_id"]
+                    )
                 )
             ).first()
             if exists is not None:
-                raise DuplicateRuleError(f"A rule with rule_id {data['rule_id']!r} already exists")
+                raise DuplicateRuleError(
+                    f"A rule with rule_id {data['rule_id']!r} already exists"
+                )
 
             obj = FirewallRule(**data)
             session.add(obj)
@@ -1414,7 +1536,9 @@ async def create_rule(rule: Mapping[str, Any], admin_user: str) -> dict:
     return result
 
 
-async def update_rule(rule_id: str, changes: Mapping[str, Any], admin_user: str) -> dict:
+async def update_rule(
+    rule_id: str, changes: Mapping[str, Any], admin_user: str
+) -> dict:
     """Change some fields of a rule and write its RULE_UPDATED audit row (one commit).
 
     `changes` may contain: rule_type, category, pattern, description, severity,
@@ -1501,7 +1625,9 @@ def normalize_client_ip(value: Any) -> str:
     try:
         addr = ipaddress.ip_address(raw)
     except ValueError:
-        raise ValueError("Enter a valid IPv4 or IPv6 address, for example 172.20.0.1.") from None
+        raise ValueError(
+            "Enter a valid IPv4 or IPv6 address, for example 172.20.0.1."
+        ) from None
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
     return str(addr)
@@ -1514,7 +1640,9 @@ def _clear_read_caches() -> None:
         if callable(clear):
             try:
                 clear()
-            except Exception:  # pragma: no cover - cache clearing must never break an admin action
+            except (
+                Exception
+            ):  # pragma: no cover - cache clearing must never break an admin action
                 logger.debug("cache_clear failed for %r", obj, exc_info=True)
 
 
@@ -1542,7 +1670,11 @@ async def delete_threat_log(request_id: str, admin_user: str) -> bool:
         }
         await session.execute(delete(ThreatLog).where(ThreatLog.request_id == rid))
         await write_audit_log(
-            admin_user=admin_user, action="LOG_DELETED", target_rule_id=rid, details=summary, session=session
+            admin_user=admin_user,
+            action="LOG_DELETED",
+            target_rule_id=rid,
+            details=summary,
+            session=session,
         )
         await session.commit()
     _clear_read_caches()
@@ -1563,23 +1695,34 @@ async def list_blocked_clients() -> list[dict]:
     async with AsyncSessionLocal() as session:
         rows = (await session.execute(stmt)).scalars().all()
     return [
-        {"client_ip": r.client_ip, "reason": r.reason or "", "blocked_by": r.blocked_by, "created_at": r.created_at}
+        {
+            "client_ip": r.client_ip,
+            "reason": r.reason or "",
+            "blocked_by": r.blocked_by,
+            "created_at": r.created_at,
+        }
         for r in rows
     ]
 
 
-async def block_client_ip(client_ip: str, admin_user: str, reason: str | None = None) -> bool:
+async def block_client_ip(
+    client_ip: str, admin_user: str, reason: str | None = None
+) -> bool:
     """Add an IP to the blocklist and audit it. Returns False if it was already blocked."""
     ip = normalize_client_ip(client_ip)
     note = (reason or "").strip()[:200] or None
     try:
         async with AsyncSessionLocal() as session:
             existing = (
-                await session.execute(select(BlockedClient.id).where(BlockedClient.client_ip == ip))
+                await session.execute(
+                    select(BlockedClient.id).where(BlockedClient.client_ip == ip)
+                )
             ).scalar_one_or_none()
             if existing is not None:
                 return False
-            session.add(BlockedClient(client_ip=ip, reason=note, blocked_by=admin_user.strip()))
+            session.add(
+                BlockedClient(client_ip=ip, reason=note, blocked_by=admin_user.strip())
+            )
             await write_audit_log(
                 admin_user=admin_user,
                 action="IP_BLOCKED",
@@ -1598,12 +1741,210 @@ async def unblock_client_ip(client_ip: str, admin_user: str) -> bool:
     """Remove an IP from the blocklist and audit it. Returns False if it was not blocked."""
     ip = normalize_client_ip(client_ip)
     async with AsyncSessionLocal() as session:
-        result = await session.execute(delete(BlockedClient).where(BlockedClient.client_ip == ip))
+        result = await session.execute(
+            delete(BlockedClient).where(BlockedClient.client_ip == ip)
+        )
         if not result.rowcount:
             return False
         await write_audit_log(
-            admin_user=admin_user, action="IP_UNBLOCKED", target_rule_id=ip, details={"client_ip": ip}, session=session
+            admin_user=admin_user,
+            action="IP_UNBLOCKED",
+            target_rule_id=ip,
+            details={"client_ip": ip},
+            session=session,
         )
         await session.commit()
     _clear_read_caches()
     return True
+
+
+# =============================================================================
+# Dashboard page queries
+# =============================================================================
+# These used to live inside the Streamlit pages. They are here so that ALL
+# database access is in this module and runs through run_sync().
+_DASH_RISK_BINS = 10
+_DASH_TOP_N = 10
+_DASH_UNIT = {"hour": literal_column("'hour'"), "day": literal_column("'day'")}
+_DASH_BINS_SQL = literal_column(str(_DASH_RISK_BINS))
+_DASH_LAST_BIN_SQL = literal_column(str(_DASH_RISK_BINS - 1))
+
+
+def _dash_since(hours: int) -> datetime:
+    return datetime.now(timezone.utc) - timedelta(hours=max(1, int(hours)))
+
+
+async def dashboard_latency_series(hours: int, bucket: str) -> list[dict]:
+    if bucket not in _DASH_UNIT:
+        raise ValueError(f"bucket must be 'hour' or 'day', got {bucket!r}")
+    start = _dash_since(hours)
+    unit = _DASH_UNIT[bucket]
+    if hours <= RECENT_HOURS_LIMIT:
+        bucket_expr = func.date_trunc(unit, ThreatLog.created_at)
+        stmt = (
+            select(
+                bucket_expr.label("bucket_start"),
+                func.avg(ThreatLog.execution_time_ms).label("avg_ms"),
+                func.percentile_cont(0.95)
+                .within_group(ThreatLog.execution_time_ms)
+                .label("p95_ms"),
+            )
+            .where(ThreatLog.created_at >= start)
+            .group_by(bucket_expr)
+            .order_by(bucket_expr)
+        )
+    else:
+        bucket_expr = func.date_trunc(unit, SystemMetric.bucket_start)
+        weight = func.sum(SystemMetric.total_requests)
+        stmt = (
+            select(
+                bucket_expr.label("bucket_start"),
+                (
+                    func.sum(SystemMetric.avg_latency_ms * SystemMetric.total_requests)
+                    / func.nullif(weight, 0)
+                ).label("avg_ms"),
+                func.max(SystemMetric.p95_latency_ms).label("p95_ms"),
+            )
+            .where(SystemMetric.bucket_start >= start, SystemMetric.total_requests > 0)
+            .group_by(bucket_expr)
+            .order_by(bucket_expr)
+        )
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(stmt)).all()
+    return [
+        {
+            "bucket_start": r.bucket_start,
+            "avg_ms": None if r.avg_ms is None else float(r.avg_ms),
+            "p95_ms": None if r.p95_ms is None else float(r.p95_ms),
+        }
+        for r in rows
+    ]
+
+
+async def dashboard_risk_histogram(hours: int) -> list[dict]:
+    index = func.greatest(
+        func.least(
+            func.floor(ThreatLog.risk_score * _DASH_BINS_SQL), _DASH_LAST_BIN_SQL
+        ),
+        0,
+    )
+    stmt = (
+        select(index.label("bin"), ThreatLog.is_blocked, func.count().label("count"))
+        .where(ThreatLog.created_at >= _dash_since(hours))
+        .group_by(index, ThreatLog.is_blocked)
+    )
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(stmt)).all()
+    return [
+        {"bin": int(r.bin), "is_blocked": bool(r.is_blocked), "count": int(r.count)}
+        for r in rows
+    ]
+
+
+async def dashboard_top_patterns(hours: int) -> list[dict]:
+    stmt = (
+        select(
+            func.coalesce(ThreatLog.triggered_rule_id, "PATTERN_MATCH").label(
+                "pattern"
+            ),
+            func.count().label("hits"),
+        )
+        .where(
+            ThreatLog.created_at >= _dash_since(hours), ThreatLog.is_blocked.is_(True)
+        )
+        .group_by("pattern")
+        .order_by(func.count().desc())
+        .limit(_DASH_TOP_N)
+    )
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(stmt)).all()
+    return [{"pattern": str(r.pattern), "hits": int(r.hits)} for r in rows]
+
+
+async def dashboard_top_clients(hours: int) -> list[dict]:
+    stmt = (
+        select(
+            ThreatLog.client_ip,
+            func.count().label("requests"),
+            func.count().filter(ThreatLog.is_blocked.is_(True)).label("blocked"),
+        )
+        .where(
+            ThreatLog.created_at >= _dash_since(hours), ThreatLog.client_ip.is_not(None)
+        )
+        .group_by(ThreatLog.client_ip)
+        .order_by(func.count().desc())
+        .limit(_DASH_TOP_N)
+    )
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(stmt)).all()
+    return [
+        {
+            "client_ip": str(r.client_ip),
+            "requests": int(r.requests),
+            "blocked": int(r.blocked),
+        }
+        for r in rows
+    ]
+
+
+async def dashboard_output_flags(hours: int) -> dict:
+    stmt = (
+        select(ThreatLog.action_taken, func.count().label("count"))
+        .where(
+            ThreatLog.created_at >= _dash_since(hours),
+            ThreatLog.output_flagged.is_(True),
+        )
+        .group_by(ThreatLog.action_taken)
+    )
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(stmt)).all()
+    total = sum(int(r.count) for r in rows)
+    by_action = [{"action": str(r.action_taken), "count": int(r.count)} for r in rows]
+    return {"total": total, "by_action": by_action}
+
+
+async def last_master_change() -> dict | None:
+    async with AsyncSessionLocal() as session:
+        stmt = (
+            select(AdminAuditLog)
+            .where(AdminAuditLog.action == "THRESHOLD_CHANGED")
+            .order_by(AdminAuditLog.timestamp.desc())
+            .limit(50)
+        )
+        rows = (await session.execute(stmt)).scalars().all()
+        for r in rows:
+            details = r.change_details or {}
+            after = details.get("after", {})
+            if (
+                "master_control" in details
+                or "master_control" in after
+                or "firewall_enabled" in str(details)
+            ):
+                mc = details.get("master_control") or after.get("master_control") or {}
+                return {
+                    "timestamp": r.timestamp,
+                    "admin_user": r.admin_user,
+                    "new_state": mc.get(
+                        "current", after.get("pipeline", {}).get("firewall_enabled")
+                    ),
+                    "reason": details.get("reason") or after.get("reason", ""),
+                }
+    return None
+
+
+async def fetch_audit_logs(limit: int = 50) -> list[dict]:
+    async with AsyncSessionLocal() as session:
+        stmt = (
+            select(AdminAuditLog).order_by(AdminAuditLog.timestamp.desc()).limit(limit)
+        )
+        rows = (await session.execute(stmt)).scalars().all()
+        return [
+            {
+                "timestamp": r.timestamp,
+                "admin_user": r.admin_user,
+                "action": r.action,
+                "target_rule_id": r.target_rule_id,
+                "change_details": r.change_details,
+            }
+            for r in rows
+        ]
