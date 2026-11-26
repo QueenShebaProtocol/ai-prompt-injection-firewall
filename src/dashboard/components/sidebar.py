@@ -56,7 +56,7 @@ def check_gateway_status() -> bool:
 def check_db_status() -> bool:
     """Check if PostgreSQL is reachable."""
     try:
-        from src.database.storage import ping_database
+        from src.database.storage import ping_database, run_sync
 
         return bool(run_sync(ping_database(), timeout=3))
     except Exception:
