@@ -714,7 +714,12 @@ def _log_entry_with_output(
     details = dict(out.get("layer_details") or {})
     details["output_scanner"] = {
         "action": scan.action,
-        "categories": list(scan.categories),  
+        "categories": list(scan.categories),
+        "truncated": scan.truncated,
+        "system_truncated": scan.system_truncated,
+        "completion_truncated": scan.completion_truncated,
+        "system_chars": scan.system_chars,
+        "completion_chars": scan.completion_chars,
     }
     out["layer_details"] = details
     out["output_flagged"] = bool(scan.flagged)

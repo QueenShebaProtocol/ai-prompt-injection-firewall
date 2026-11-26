@@ -444,3 +444,78 @@ class TestSeededRules:
     def test_invalid_regex_raises_a_clear_error_at_load_time(self):
         with pytest.raises(osc.OutputScannerRuleError):
             osc._compile_regex("RULE_PII_BAD_01", "([unclosed", 0)
+
+# ---------------------------------------------------------------------------
+# Review comment 1: system-prompt truncation is configurable, cached, never silent
+# ---------------------------------------------------------------------------
+def _long_prompt(n_words):  # all-unique words, so no accidental overlaps
+    return " ".join(f"tok{i}" for i in range(n_words))
+
+
+class TestLeakTruncation:
+    @pytest.fixture(autouse=True)
+    def _clean_caches(self):
+        osc._shingle_cache.clear()
+        osc._warned_prompts.clear()
+        osc._last_completion_warning = 0.0
+
+    def test_prompt_under_limit_is_not_truncated(self):
+        info = osc.detect_system_prompt_leak_ex("hello world", _long_prompt(300), max_system_chars=100_000)
+        assert info.truncated is False
+
+    def test_leak_in_tail_is_detected_when_limit_is_high(self):
+        leak = " ".join(f"tok{i}" for i in range(280, 296))
+        info = osc.detect_system_prompt_leak_ex("Sure: " + leak, _long_prompt(300), max_system_chars=100_000)
+        assert info.spans and not info.system_truncated
+
+    def test_over_limit_sets_flag_and_warns_once_without_prompt_text(self, caplog):
+        p = _long_prompt(300)
+        leak = " ".join(f"tok{i}" for i in range(280, 296))
+        with caplog.at_level(logging.WARNING, logger="firewall.output_scanner"):
+            a = osc.detect_system_prompt_leak_ex("Sure: " + leak, p, max_system_chars=1000)
+            b = osc.detect_system_prompt_leak_ex("Sure: " + leak, p, max_system_chars=1000)
+        assert a.system_truncated and b.system_truncated
+        assert a.spans == []  # documents the known gap above the limit
+        warnings = [r for r in caplog.records if "max_system_chars" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "tok280" not in caplog.text
+
+    def test_shingle_set_is_cached(self, monkeypatch):
+        calls = []
+        real = osc._build_shingle_set
+        monkeypatch.setattr(osc, "_build_shingle_set", lambda *a: (calls.append(1), real(*a))[1])
+        p = _long_prompt(100)
+        for _ in range(3):
+            osc.detect_system_prompt_leak_ex("x " * 20, p)
+        assert len(calls) == 1
+
+    def test_completion_over_limit_is_flagged(self):
+        info = osc.detect_system_prompt_leak_ex("word " * 100, _long_prompt(100), max_completion_chars=50)
+        assert info.completion_truncated
+
+    def test_wrapper_keeps_the_contract_signature(self):
+        assert osc.detect_system_prompt_leak("", "anything") == []
+
+    def test_scan_output_blocks_when_on_truncate_is_block(self, monkeypatch):
+        from src.engine import pipeline
+
+        cfg = pipeline.PipelineConfig(
+            output_scanner_enabled=True, output_on_detect="redact",
+            output_max_system_chars=1000, output_on_truncate="block",
+        )
+        monkeypatch.setattr(pipeline, "get_pipeline_config", lambda: cfg)
+        monkeypatch.setattr(pipeline, "detect_pii", lambda text: [])
+        result = asyncio.run(pipeline.scan_output("hello there", _long_prompt(300), "req-1"))
+        assert result.truncated and result.action == "BLOCK"
+        assert "SCAN_INCOMPLETE" in result.categories
+
+    def test_scan_output_only_flags_when_on_truncate_is_warn(self, monkeypatch):
+        from src.engine import pipeline
+
+        cfg = pipeline.PipelineConfig(
+            output_scanner_enabled=True, output_max_system_chars=1000, output_on_truncate="warn",
+        )
+        monkeypatch.setattr(pipeline, "get_pipeline_config", lambda: cfg)
+        monkeypatch.setattr(pipeline, "detect_pii", lambda text: [])
+        result = asyncio.run(pipeline.scan_output("hello there", _long_prompt(300), "req-2"))
+        assert result.truncated and result.action == "PASS" and not result.flagged

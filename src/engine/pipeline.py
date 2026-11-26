@@ -21,9 +21,10 @@ under both names so each caller finds it.
 import inspect
 import logging
 import os
+import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 import yaml
 
@@ -35,10 +36,8 @@ from src.engine.output_scanner import (
     OutputScanResult,
     detect_pii,
     detect_system_prompt_leak,
+    detect_system_prompt_leak_ex,
 )
-import threading
-...
-from dataclasses import dataclass, field, fields
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +49,9 @@ class PipelineConfigError(ValueError):
 
 
 OUTPUT_ON_DETECT_CHOICES = frozenset({"block", "redact", "warn"})
+
+OUTPUT_ON_TRUNCATE_CHOICES = frozenset({"warn", "block"})
+MIN_SCAN_CHARS = 1000
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,10 @@ class PipelineConfig:
     max_context_chars: int = 2000        
     output_scanner_enabled: bool = True
     output_on_detect: str = "redact"      # block | redact | warn
+    output_max_system_chars: int = 1_000_000
+    output_max_completion_chars: int = 200_000
+    output_on_truncate: str = "warn"       # warn | block
+
 
     def __post_init__(self):
         for name in ("high_confidence_threshold", "low_confidence_threshold"):
@@ -82,6 +88,19 @@ class PipelineConfig:
             raise PipelineConfigError(
                 f"output_scanner.on_detect must be one of "
                 f"{sorted(OUTPUT_ON_DETECT_CHOICES)}, got {self.output_on_detect!r}"
+            )
+        if (
+            self.output_max_system_chars < MIN_SCAN_CHARS
+            or self.output_max_completion_chars < MIN_SCAN_CHARS
+        ):
+            raise PipelineConfigError(
+                f"output_scanner.max_system_chars and max_completion_chars "
+                f"must be at least {MIN_SCAN_CHARS}."
+            )
+        if self.output_on_truncate not in OUTPUT_ON_TRUNCATE_CHOICES:
+            raise PipelineConfigError(
+                f"output_scanner.on_truncate must be one of "
+                f"{sorted(OUTPUT_ON_TRUNCATE_CHOICES)}, got {self.output_on_truncate!r}"
             )
 
 
@@ -212,8 +231,10 @@ def load_pipeline_config(path, runtime_path=None) -> PipelineConfig:
         max_context_chars=_get_number(layer2, "max_context_chars", d.max_context_chars, int),
         output_scanner_enabled=_get_bool(pipeline, "output_scanner_enabled", d.output_scanner_enabled),
         output_on_detect=_get_choice(scanner, "on_detect", d.output_on_detect, OUTPUT_ON_DETECT_CHOICES),
+        output_max_system_chars=_get_number(scanner, "max_system_chars", d.output_max_system_chars, int),
+        output_max_completion_chars=_get_number(scanner, "max_completion_chars", d.output_max_completion_chars, int),
+        output_on_truncate=_get_choice(scanner, "on_truncate", d.output_on_truncate, OUTPUT_ON_TRUNCATE_CHOICES),
     )
-
 
 _config: PipelineConfig | None = None
 
@@ -555,9 +576,15 @@ async def scan_output(
     """
     cfg = get_pipeline_config()
     if not cfg.output_scanner_enabled:
-        return OutputScanResult(flagged=False, action="PASS")
+        return OutputScanResult(flagged=False,action="PASS")
 
-    spans = list(detect_system_prompt_leak(completion_text, system_instruction))
+    leak = detect_system_prompt_leak_ex(
+        completion_text,
+        system_instruction,
+        max_system_chars=cfg.output_max_system_chars,
+        max_completion_chars=cfg.output_max_completion_chars,
+    )
+    spans = list(leak.spans)
 
     # detect_pii loads its rules from the database, so it is async. Accept a
     # plain list too, so a sync detector (or a test double) keeps working.
@@ -571,13 +598,25 @@ async def scan_output(
     categories = sorted({sp.category for sp in spans})
     action = cfg.output_on_detect.upper() if flagged else "PASS"
 
+    # Fail closed on an incomplete check, if the operator asked for it.
+    if leak.truncated and cfg.output_on_truncate == "block":
+        flagged, action = True, "BLOCK"
+        categories = sorted(set(categories) | {"SCAN_INCOMPLETE"})
+
     if flagged:
         logger.warning(
             "Output scanner flagged request %s: %d span(s), categories=%s, action=%s",
             request_id, len(spans), categories, action,
         )
 
-    return OutputScanResult(flagged=flagged, categories=categories, spans=spans, action=action)
+    return OutputScanResult(
+        flagged=flagged, categories=categories, spans=spans, action=action,
+        truncated=leak.truncated,
+        system_truncated=leak.system_truncated,
+        completion_truncated=leak.completion_truncated,
+        system_chars=leak.system_chars,
+        completion_chars=leak.completion_chars,
+    )
 
 
 # handler.py calls output_scanner.scan_output(...); the contract defines the
