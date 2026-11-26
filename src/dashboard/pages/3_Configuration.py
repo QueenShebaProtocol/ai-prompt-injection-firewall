@@ -25,7 +25,6 @@ if str(_REPO_ROOT) not in sys.path:
 import streamlit as st
 import streamlit.components.v1 as components
 import yaml
-from sqlalchemy import select
 
 from src.dashboard.assets import get_crest_data_uri
 from src.dashboard.components.sidebar import render_sidebar
@@ -36,11 +35,11 @@ from src.dashboard.session import (
     sync_session_cookie,
 )
 from src.dashboard.styles import inject_theme
-from src.database.models import AdminAuditLog
 from src.database.storage import (
-    AsyncSessionLocal,
     create_rule,
     delete_rule,
+    fetch_audit_logs as _fetch_audit_logs,
+    last_master_change as _last_master_change,
     list_rules,
     run_sync,
     update_rule,
@@ -63,13 +62,36 @@ OUTPUT_ACTIONS = ("block", "redact", "warn")
 MAX_PATTERN_LENGTH = 500
 MAX_DESCRIPTION_LENGTH = 200
 RULE_ID_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
-EDITABLE_FIELDS = ("rule_type", "category", "pattern", "description", "severity", "is_active")
+EDITABLE_FIELDS = (
+    "rule_type",
+    "category",
+    "pattern",
+    "description",
+    "severity",
+    "is_active",
+)
 
 LAYER_FLAGS = (
-    ("layer_1_enabled", "Layer 1 — Deterministic rules", "Regex and keyword matching · sub-millisecond"),
-    ("layer_2_enabled", "Layer 2 — ONNX classifier", "DeBERTa v3 prompt-injection model · local CPU"),
-    ("layer_3_enabled", "Layer 3 — LLM evaluator", "phi4-mini judge for uncertain prompts · fails closed"),
-    ("output_scanner_enabled", "Output scanner", "Detects leaked system prompt, PII and secrets"),
+    (
+        "layer_1_enabled",
+        "Layer 1 — Deterministic rules",
+        "Regex and keyword matching · sub-millisecond",
+    ),
+    (
+        "layer_2_enabled",
+        "Layer 2 — ONNX classifier",
+        "DeBERTa v3 prompt-injection model · local CPU",
+    ),
+    (
+        "layer_3_enabled",
+        "Layer 3 — LLM evaluator",
+        "phi4-mini judge for uncertain prompts · fails closed",
+    ),
+    (
+        "output_scanner_enabled",
+        "Output scanner",
+        "Detects leaked system prompt, PII and secrets",
+    ),
 )
 
 RUNTIME_CONFIG_ENV = "FIREWALL_RUNTIME_CONFIG_PATH"
@@ -105,7 +127,7 @@ def _read_dotenv(path: Path) -> dict[str, str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         if line.startswith("export "):
-            line = line[len("export "):]
+            line = line[len("export ") :]
         key, _, value = line.partition("=")
         values[key.strip()] = value.strip().strip("'\"")
     return values
@@ -143,7 +165,9 @@ def _register_failure() -> None:
 
 
 # ------------------------------------------------------------------ Validation
-def validate_rule(rule: dict, existing_ids: Iterable[str] = (), is_new: bool = True) -> list[str]:
+def validate_rule(
+    rule: dict, existing_ids: Iterable[str] = (), is_new: bool = True
+) -> list[str]:
     errors: list[str] = []
     rule_id = str(rule.get("rule_id", "")).strip()
     rule_type = rule.get("rule_type")
@@ -155,7 +179,9 @@ def validate_rule(rule: dict, existing_ids: Iterable[str] = (), is_new: bool = T
     if not rule_id:
         errors.append("Rule ID is required.")
     elif not RULE_ID_RE.match(rule_id):
-        errors.append("Rule ID must start with a capital letter and use only capital letters, digits and underscores (3 to 64 characters).")
+        errors.append(
+            "Rule ID must start with a capital letter and use only capital letters, digits and underscores (3 to 64 characters)."
+        )
     elif is_new and rule_id in set(existing_ids):
         errors.append(f"A rule with ID {rule_id} already exists.")
 
@@ -169,24 +195,32 @@ def validate_rule(rule: dict, existing_ids: Iterable[str] = (), is_new: bool = T
     if not pattern.strip():
         errors.append("Pattern is required.")
     elif len(pattern) > MAX_PATTERN_LENGTH:
-        errors.append(f"Pattern is {len(pattern)} characters long. The limit is {MAX_PATTERN_LENGTH}.")
+        errors.append(
+            f"Pattern is {len(pattern)} characters long. The limit is {MAX_PATTERN_LENGTH}."
+        )
     elif rule_type == "REGEX":
         try:
             compiled = re.compile(pattern)
             if compiled.search(""):
-                errors.append("Pattern matches empty text, so it would block every prompt.")
+                errors.append(
+                    "Pattern matches empty text, so it would block every prompt."
+                )
         except re.error as exc:
             errors.append(f"Pattern is not a valid regular expression: {exc}.")
 
     if len(description) > MAX_DESCRIPTION_LENGTH:
-        errors.append(f"Description is {len(description)} characters long. The limit is {MAX_DESCRIPTION_LENGTH}.")
+        errors.append(
+            f"Description is {len(description)} characters long. The limit is {MAX_DESCRIPTION_LENGTH}."
+        )
     return errors
 
 
 def validate_settings(settings: dict) -> list[str]:
     errors: list[str] = []
     pipeline = settings.get("pipeline", {})
-    if "firewall_enabled" in pipeline and not isinstance(pipeline.get("firewall_enabled"), bool):
+    if "firewall_enabled" in pipeline and not isinstance(
+        pipeline.get("firewall_enabled"), bool
+    ):
         errors.append("firewall_enabled must be on or off.")
     for flag, _, _ in LAYER_FLAGS:
         if not isinstance(pipeline.get(flag), bool):
@@ -196,13 +230,19 @@ def validate_settings(settings: dict) -> list[str]:
     high = layer_2.get("high_confidence_threshold")
     numbers_ok = True
     for label, value in (("Low", low), ("High", high)):
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not 0.0 <= value <= 1.0
+        ):
             errors.append(f"{label} threshold must be a number from 0.00 to 1.00.")
             numbers_ok = False
     if numbers_ok and not low < high:
         errors.append("The low threshold must be smaller than the high threshold.")
     if settings.get("output_scanner", {}).get("on_detect") not in OUTPUT_ACTIONS:
-        errors.append(f"Output scanner action must be one of: {', '.join(OUTPUT_ACTIONS)}.")
+        errors.append(
+            f"Output scanner action must be one of: {', '.join(OUTPUT_ACTIONS)}."
+        )
     return errors
 
 
@@ -253,13 +293,19 @@ def _load_settings() -> dict:
 def _write_runtime_file(path: str, settings: dict) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    text = (
-        "# Written by Sheba Shield dashboard.\n"
-        + yaml.safe_dump(settings, sort_keys=True, default_flow_style=False)
+    text = "# Written by Sheba Shield dashboard.\n" + yaml.safe_dump(
+        settings, sort_keys=True, default_flow_style=False
     )
     tmp_name = None
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=target.parent, prefix=".firewall-", suffix=".tmp", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=".firewall-",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
             tmp_name = tmp.name
             tmp.write(text)
             tmp.flush()
@@ -279,78 +325,53 @@ def _save_settings(settings: dict, admin_user: str) -> None:
     new = _overlay_keys(settings)
     path = _runtime_config_path()
     if not path:
-        raise RuntimeError(f"{RUNTIME_CONFIG_ENV} is not set, so settings cannot be saved.")
+        raise RuntimeError(
+            f"{RUNTIME_CONFIG_ENV} is not set, so settings cannot be saved."
+        )
     old = _overlay_keys(_load_settings())
     _write_runtime_file(path, new)
     try:
-        run_sync(write_audit_log(admin_user=admin_user, action="THRESHOLD_CHANGED", before=old, after=new))
+        run_sync(
+            write_audit_log(
+                admin_user=admin_user, action="THRESHOLD_CHANGED", before=old, after=new
+            )
+        )
     except Exception as exc:
         logger.warning(f"Settings saved but audit log failed: {exc}")
 
 
-def _save_master_setting(settings: dict, new_state: bool, admin_user: str, reason: str = "") -> None:
+def _save_master_setting(
+    settings: dict, new_state: bool, admin_user: str, reason: str = ""
+) -> None:
     settings["pipeline"]["firewall_enabled"] = new_state
     new = _overlay_keys(settings)
     path = _runtime_config_path()
     if not path:
-        raise RuntimeError(f"{RUNTIME_CONFIG_ENV} is not set, so settings cannot be saved.")
+        raise RuntimeError(
+            f"{RUNTIME_CONFIG_ENV} is not set, so settings cannot be saved."
+        )
     old = _overlay_keys(_load_settings())
     _write_runtime_file(path, new)
     try:
-        run_sync(write_audit_log(
-            admin_user=admin_user,
-            action="THRESHOLD_CHANGED",
-            before=old,
-            after={
-                **new,
-                "master_control": {
-                    "previous": old.get("pipeline", {}).get("firewall_enabled", True),
-                    "current": new_state,
+        run_sync(
+            write_audit_log(
+                admin_user=admin_user,
+                action="THRESHOLD_CHANGED",
+                before=old,
+                after={
+                    **new,
+                    "master_control": {
+                        "previous": old.get("pipeline", {}).get(
+                            "firewall_enabled", True
+                        ),
+                        "current": new_state,
+                    },
+                    "reason": reason,
                 },
-                "reason": reason,
-            },
-        ))
+            )
+        )
     except Exception as exc:
         logger.warning(f"Master setting saved but audit log failed: {exc}")
-
-
-async def _last_master_change() -> dict | None:
-    async with AsyncSessionLocal() as session:
-        stmt = (
-            select(AdminAuditLog)
-            .where(AdminAuditLog.action == "THRESHOLD_CHANGED")
-            .order_by(AdminAuditLog.timestamp.desc())
-            .limit(50)
-        )
-        rows = (await session.execute(stmt)).scalars().all()
-        for r in rows:
-            details = r.change_details or {}
-            after = details.get("after", {})
-            if "master_control" in details or "master_control" in after or "firewall_enabled" in str(details):
-                mc = details.get("master_control") or after.get("master_control") or {}
-                return {
-                    "timestamp": r.timestamp,
-                    "admin_user": r.admin_user,
-                    "new_state": mc.get("current", after.get("pipeline", {}).get("firewall_enabled")),
-                    "reason": details.get("reason") or after.get("reason", ""),
-                }
-    return None
-
-
-async def _fetch_audit_logs(limit: int = 50) -> list[dict]:
-    async with AsyncSessionLocal() as session:
-        stmt = select(AdminAuditLog).order_by(AdminAuditLog.timestamp.desc()).limit(limit)
-        rows = (await session.execute(stmt)).scalars().all()
-        return [
-            {
-                "timestamp": r.timestamp,
-                "admin_user": r.admin_user,
-                "action": r.action,
-                "target_rule_id": r.target_rule_id,
-                "change_details": r.change_details,
-            }
-            for r in rows
-        ]
 
 
 # ------------------------------------------------------------------ Page Main Runner
@@ -367,7 +388,10 @@ def main() -> None:
     render_sidebar(current_page="config", auto_refresh=False)
 
     # Handle signout query param
-    if st.query_params.get("signout") in ("1", "true") or st.query_params.get("action") == "signout":
+    if (
+        st.query_params.get("signout") in ("1", "true")
+        or st.query_params.get("action") == "signout"
+    ):
         end_admin_session()
         try:
             del st.query_params["signout"]
@@ -404,7 +428,9 @@ def main() -> None:
         if admin_user:
             initial = html.escape((admin_user or "A")[:1].upper())
             user_display = html.escape(admin_user)
-            user_label = html.escape(admin_user.capitalize() if admin_user.islower() else admin_user)
+            user_label = html.escape(
+                admin_user.capitalize() if admin_user.islower() else admin_user
+            )
 
             st.markdown(
                 f"""
@@ -540,10 +566,19 @@ def main() -> None:
                     """,
                     unsafe_allow_html=True,
                 )
-                entered_name = st.text_input("Admin name", placeholder="e.g. admin", key="login_name")
-                entered_pass = st.text_input("Password", type="password", placeholder="Enter admin password", key="login_pass")
+                entered_name = st.text_input(
+                    "Admin name", placeholder="e.g. admin", key="login_name"
+                )
+                entered_pass = st.text_input(
+                    "Password",
+                    type="password",
+                    placeholder="Enter admin password",
+                    key="login_pass",
+                )
                 st.markdown('<div style="height:6px;"></div>', unsafe_allow_html=True)
-                submitted = st.form_submit_button("Sign in", type="primary", width='stretch')
+                submitted = st.form_submit_button(
+                    "Sign in", type="primary", width="stretch"
+                )
                 st.markdown(
                     '<p style="font-size:11.5px;color:var(--faint);text-align:center;margin-top:14px;margin-bottom:0;">Demo: any name and password. All changes are written to the audit log.</p>',
                     unsafe_allow_html=True,
@@ -556,7 +591,9 @@ def main() -> None:
                     st.error(f"Too many wrong attempts. Locked out for {remaining}s.")
                 elif not clean:
                     st.error("Please enter a valid admin name.")
-                elif expected_pass and not _password_matches(entered_pass, expected_pass):
+                elif expected_pass and not _password_matches(
+                    entered_pass, expected_pass
+                ):
                     _register_failure()
                     st.error("Invalid administrator password.")
                 else:
@@ -606,9 +643,15 @@ def main() -> None:
 
     if last_change and last_change.get("timestamp"):
         t = last_change["timestamp"]
-        t_str = t.strftime("%Y-%m-%d %H:%M:%S UTC") if hasattr(t, "strftime") else str(t)[:19] + " UTC"
+        t_str = (
+            t.strftime("%Y-%m-%d %H:%M:%S UTC")
+            if hasattr(t, "strftime")
+            else str(t)[:19] + " UTC"
+        )
         who = last_change.get("admin_user", "admin")
-        reason_txt = f" · Reason: {last_change['reason']}" if last_change.get("reason") else ""
+        reason_txt = (
+            f" · Reason: {last_change['reason']}" if last_change.get("reason") else ""
+        )
         meta_html = f"Last state change: <b class='mono' style='color:var(--ivory)'>{html.escape(t_str)}</b> by <b style='color:var(--gold-2)'>{html.escape(who)}</b>{html.escape(reason_txt)}"
     else:
         meta_html = "Protection State: <b style='color:var(--gold-2)'>Default configuration active (Initial boot)</b>"
@@ -642,7 +685,11 @@ def main() -> None:
     # Master Switch Actions and Confirmation Modal
     if master_on:
         if not st.session_state.get("show_disable_confirm", False):
-            if st.button("Disable Firewall (Emergency Bypass)", type="secondary", key="btn_trigger_master_off"):
+            if st.button(
+                "Disable Firewall (Emergency Bypass)",
+                type="secondary",
+                key="btn_trigger_master_off",
+            ):
                 st.session_state["show_disable_confirm"] = True
                 st.rerun()
         else:
@@ -668,33 +715,54 @@ def main() -> None:
                 )
                 dc1, dc2, _ = st.columns([1.6, 1.2, 3])
                 with dc1:
-                    if st.button("Confirm: Switch Firewall OFF", type="primary", key="btn_confirm_master_off", width='stretch'):
+                    if st.button(
+                        "Confirm: Switch Firewall OFF",
+                        type="primary",
+                        key="btn_confirm_master_off",
+                        width="stretch",
+                    ):
                         state["pipeline"]["firewall_enabled"] = False
-                        _save_master_setting(state, False, admin_user, disable_reason or "Admin bypass")
+                        _save_master_setting(
+                            state, False, admin_user, disable_reason or "Admin bypass"
+                        )
                         st.session_state["show_disable_confirm"] = False
                         st.session_state["cfg_state"] = _load_settings()
-                        st.success("Firewall has been DISABLED. Incoming requests are now bypassing inspection.")
+                        st.success(
+                            "Firewall has been DISABLED. Incoming requests are now bypassing inspection."
+                        )
                         st.rerun()
                 with dc2:
-                    if st.button("Cancel", key="btn_cancel_master_off", width='stretch'):
+                    if st.button(
+                        "Cancel", key="btn_cancel_master_off", width="stretch"
+                    ):
                         st.session_state["show_disable_confirm"] = False
                         st.rerun()
     else:
-        if st.button("Activate Firewall (Enable Protection)", type="primary", key="btn_trigger_master_on"):
+        if st.button(
+            "Activate Firewall (Enable Protection)",
+            type="primary",
+            key="btn_trigger_master_on",
+        ):
             state["pipeline"]["firewall_enabled"] = True
-            _save_master_setting(state, True, admin_user, "Restored firewall protection")
+            _save_master_setting(
+                state, True, admin_user, "Restored firewall protection"
+            )
             st.session_state["cfg_state"] = _load_settings()
-            st.success("Firewall has been ACTIVATED. All enabled detection layers are now standing guard.")
+            st.success(
+                "Firewall has been ACTIVATED. All enabled detection layers are now standing guard."
+            )
             st.rerun()
 
     st.markdown('<div style="height:12px;"></div>', unsafe_allow_html=True)
 
-    tab_layers, tab_rules, tab_deny, tab_audit = st.tabs([
-        "Layers & thresholds",
-        "Rules",
-        "Keyword deny list",
-        "Audit log",
-    ])
+    tab_layers, tab_rules, tab_deny, tab_audit = st.tabs(
+        [
+            "Layers & thresholds",
+            "Rules",
+            "Keyword deny list",
+            "Audit log",
+        ]
+    )
 
     # ------------------------------------------------------------------ TAB 1: Layers & Thresholds
     with tab_layers:
@@ -777,20 +845,30 @@ def main() -> None:
             with th_c1:
                 new_low = st.slider(
                     "Low-confidence threshold",
-                    0.0, 1.0, cur_low, 0.01,
+                    0.0,
+                    1.0,
+                    cur_low,
+                    0.01,
                     format="%.2f",
                     key="cfg_slider_low",
                 )
             with th_c2:
                 new_high = st.slider(
                     "High-confidence threshold",
-                    0.0, 1.0, cur_high, 0.01,
+                    0.0,
+                    1.0,
+                    cur_high,
+                    0.01,
                     format="%.2f",
                     key="cfg_slider_high",
                 )
 
-            state["layer_2"]["low_confidence_threshold"] = round(min(new_low, new_high - 0.01), 2)
-            state["layer_2"]["high_confidence_threshold"] = round(max(new_high, new_low + 0.01), 2)
+            state["layer_2"]["low_confidence_threshold"] = round(
+                min(new_low, new_high - 0.01), 2
+            )
+            state["layer_2"]["high_confidence_threshold"] = round(
+                max(new_high, new_low + 0.01), 2
+            )
 
             st.markdown(
                 """
@@ -805,7 +883,11 @@ def main() -> None:
             act_choice = st.radio(
                 "Action on detect",
                 options=["block", "redact", "warn"],
-                index=["block", "redact", "warn"].index(cur_act) if cur_act in ("block", "redact", "warn") else 1,
+                index=(
+                    ["block", "redact", "warn"].index(cur_act)
+                    if cur_act in ("block", "redact", "warn")
+                    else 1
+                ),
                 horizontal=True,
                 key="cfg_act_radio",
                 label_visibility="collapsed",
@@ -829,11 +911,18 @@ def main() -> None:
             )
             sb_col1, sb_col2 = st.columns([1, 1])
             with sb_col1:
-                if st.button("Discard changes", key="btn_discard_settings", width='stretch'):
+                if st.button(
+                    "Discard changes", key="btn_discard_settings", width="stretch"
+                ):
                     st.session_state["cfg_state"] = _load_settings()
                     st.rerun()
             with sb_col2:
-                if st.button("Save settings", type="primary", key="btn_save_settings", width='stretch'):
+                if st.button(
+                    "Save settings",
+                    type="primary",
+                    key="btn_save_settings",
+                    width="stretch",
+                ):
                     try:
                         _save_settings(state, admin_user)
                         st.success("Settings saved successfully and persisted.")
@@ -873,16 +962,20 @@ def main() -> None:
                 sev = r.get("severity", "HIGH")
                 pat = r.get("pattern", "")
                 active = "Active" if r.get("is_active") else "Disabled"
-                active_badge = f'<span class="badge b-passed">{active}</span>' if r.get("is_active") else f'<span class="badge b-redacted">{active}</span>'
+                active_badge = (
+                    f'<span class="badge b-passed">{active}</span>'
+                    if r.get("is_active")
+                    else f'<span class="badge b-redacted">{active}</span>'
+                )
                 r_rows.append(
-                    f'<tr>'
-                    f'<td>{active_badge}</td>'
+                    f"<tr>"
+                    f"<td>{active_badge}</td>"
                     f'<td class="mono">{html.escape(rid)}</td>'
                     f'<td><span class="tag">{html.escape(rtype)}</span></td>'
-                    f'<td>{html.escape(cat)}</td>'
+                    f"<td>{html.escape(cat)}</td>"
                     f'<td><span class="tag sev-{sev}">{sev}</span></td>'
                     f'<td class="mono trunc">{html.escape(pat)}</td>'
-                    f'</tr>'
+                    f"</tr>"
                 )
             st.markdown(
                 f"""
@@ -898,8 +991,15 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
 
-        st.markdown('<h3 style="margin-top:24px;">Manage rules</h3>', unsafe_allow_html=True)
-        rule_action = st.radio("Rule action", ["Add rule", "Enable / disable", "Delete rule"], horizontal=True, key="rule_action_choice")
+        st.markdown(
+            '<h3 style="margin-top:24px;">Manage rules</h3>', unsafe_allow_html=True
+        )
+        rule_action = st.radio(
+            "Rule action",
+            ["Add rule", "Enable / disable", "Delete rule"],
+            horizontal=True,
+            key="rule_action_choice",
+        )
 
         all_ids = [r["rule_id"] for r in rules_list]
 
@@ -909,7 +1009,9 @@ def main() -> None:
                 new_type = st.selectbox("Type", RULE_TYPES)
                 new_cat = st.selectbox("Category", CATEGORIES)
                 new_sev = st.selectbox("Severity", SEVERITIES, index=2)
-                new_pat = st.text_area("Pattern", placeholder="Regex pattern or keyword phrase")
+                new_pat = st.text_area(
+                    "Pattern", placeholder="Regex pattern or keyword phrase"
+                )
                 new_desc = st.text_input("Description", placeholder="Rule purpose")
                 add_sub = st.form_submit_button("Add rule", type="primary")
 
@@ -936,13 +1038,23 @@ def main() -> None:
 
         elif rule_action == "Enable / disable":
             if all_ids:
-                target_id = st.selectbox("Select rule", all_ids, key="toggle_rule_select")
+                target_id = st.selectbox(
+                    "Select rule", all_ids, key="toggle_rule_select"
+                )
                 curr_rule = next(r for r in rules_list if r["rule_id"] == target_id)
                 is_act = bool(curr_rule.get("is_active", True))
-                st.write(f"Rule `{target_id}` is currently **{'Active' if is_act else 'Disabled'}**.")
-                if st.button("Disable rule" if is_act else "Enable rule", key="btn_toggle_act"):
+                st.write(
+                    f"Rule `{target_id}` is currently **{'Active' if is_act else 'Disabled'}**."
+                )
+                if st.button(
+                    "Disable rule" if is_act else "Enable rule", key="btn_toggle_act"
+                ):
                     try:
-                        run_sync(update_rule(target_id, {"is_active": not is_act}, admin_user))
+                        run_sync(
+                            update_rule(
+                                target_id, {"is_active": not is_act}, admin_user
+                            )
+                        )
                         st.success(f"Rule {target_id} updated.")
                         st.rerun()
                     except Exception as exc:
@@ -950,9 +1062,15 @@ def main() -> None:
 
         elif rule_action == "Delete rule":
             if all_ids:
-                del_id = st.selectbox("Select rule to delete", all_ids, key="del_rule_select")
-                confirm_del = st.checkbox(f"Yes, permanently delete {del_id}", key="confirm_del_chk")
-                if st.button("Delete rule", disabled=not confirm_del, key="btn_del_exec"):
+                del_id = st.selectbox(
+                    "Select rule to delete", all_ids, key="del_rule_select"
+                )
+                confirm_del = st.checkbox(
+                    f"Yes, permanently delete {del_id}", key="confirm_del_chk"
+                )
+                if st.button(
+                    "Delete rule", disabled=not confirm_del, key="btn_del_exec"
+                ):
                     try:
                         run_sync(delete_rule(del_id, admin_user))
                         st.success(f"Rule {del_id} deleted.")
@@ -981,9 +1099,15 @@ def main() -> None:
         with st.form("form_add_deny_phrase"):
             d_c1, d_c2 = st.columns([3, 1])
             with d_c1:
-                phrase_in = st.text_input("New phrase", placeholder="e.g. reveal your system prompt", label_visibility="collapsed")
+                phrase_in = st.text_input(
+                    "New phrase",
+                    placeholder="e.g. reveal your system prompt",
+                    label_visibility="collapsed",
+                )
             with d_c2:
-                add_phrase_sub = st.form_submit_button("Add phrase", type="primary", width='stretch')
+                add_phrase_sub = st.form_submit_button(
+                    "Add phrase", type="primary", width="stretch"
+                )
 
         if add_phrase_sub and phrase_in.strip():
             clean_phrase = phrase_in.strip()
@@ -1007,12 +1131,14 @@ def main() -> None:
                 }
                 try:
                     run_sync(create_rule(rule_dict, admin_user))
-                    st.success(f"Added \"{clean_phrase}\" as {rule_id}.")
+                    st.success(f'Added "{clean_phrase}" as {rule_id}.')
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Failed to add keyword: {exc}")
 
-        st.markdown('<div class="chips" style="margin-top:16px;">', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="chips" style="margin-top:16px;">', unsafe_allow_html=True
+        )
         chips_html = []
         for k in keywords:
             pat = k.get("pattern") or ""
@@ -1020,13 +1146,23 @@ def main() -> None:
             chips_html.append(
                 f'<span class="chip">{html.escape(pat)} <small style="color:var(--faint);font-size:10px;">({rid})</small></span>'
             )
-        st.markdown("".join(chips_html) or '<span class="hint">No deny list phrases configured.</span>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown(
+            "".join(chips_html)
+            or '<span class="hint">No deny list phrases configured.</span>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
         if keywords:
             st.markdown('<div style="height:20px;"></div>', unsafe_allow_html=True)
-            rem_opts = {k["rule_id"]: f"{k.get('pattern')}  ({k['rule_id']})" for k in keywords}
-            picked_rem = st.selectbox("Select phrase to remove:", list(rem_opts.keys()), format_func=lambda x: rem_opts.get(x, x))
+            rem_opts = {
+                k["rule_id"]: f"{k.get('pattern')}  ({k['rule_id']})" for k in keywords
+            }
+            picked_rem = st.selectbox(
+                "Select phrase to remove:",
+                list(rem_opts.keys()),
+                format_func=lambda x: rem_opts.get(x, x),
+            )
             if st.button("Remove phrase", key="btn_remove_deny_phrase"):
                 try:
                     run_sync(delete_rule(picked_rem, admin_user))
@@ -1057,7 +1193,11 @@ def main() -> None:
             audit_html = []
             for r in audit_records:
                 t = r.get("timestamp")
-                t_str = t.strftime("%Y-%m-%d %H:%M") if hasattr(t, "strftime") else str(t)[:16]
+                t_str = (
+                    t.strftime("%Y-%m-%d %H:%M")
+                    if hasattr(t, "strftime")
+                    else str(t)[:16]
+                )
                 who = r.get("admin_user") or "admin"
                 act = r.get("action") or "CHANGE"
                 details = r.get("change_details") or {}
@@ -1067,10 +1207,18 @@ def main() -> None:
                     mc = details.get("master_control")
                     if mc is not None:
                         state_lbl = "ON" if mc.get("current") else "OFF (Bypassed)"
-                        reason_lbl = f" — Reason: {details.get('reason')}" if details.get("reason") else ""
+                        reason_lbl = (
+                            f" — Reason: {details.get('reason')}"
+                            if details.get("reason")
+                            else ""
+                        )
                         msg = f"Switched Firewall Master Control to {state_lbl}{reason_lbl}"
                     elif "firewall_enabled" in str(details):
-                        after_fe = details.get("after", {}).get("pipeline", {}).get("firewall_enabled")
+                        after_fe = (
+                            details.get("after", {})
+                            .get("pipeline", {})
+                            .get("firewall_enabled")
+                        )
                         state_lbl = "ON" if after_fe else "OFF (Bypassed)"
                         msg = f"Switched Firewall Master Control to {state_lbl}"
                     else:
@@ -1088,10 +1236,10 @@ def main() -> None:
                 elif act == "IP_UNBLOCKED":
                     msg = f"Unblocked client IP {target}"
                 audit_html.append(
-                    f'<li>'
+                    f"<li>"
                     f'<time class="mono">{html.escape(t_str)}</time>'
                     f'<span><b style="color:var(--gold-2)">{html.escape(who)}</b> — {html.escape(msg)}</span>'
-                    f'</li>'
+                    f"</li>"
                 )
             st.markdown(
                 f'<ul class="audit mt">{"".join(audit_html)}</ul>',
