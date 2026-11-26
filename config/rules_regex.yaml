@@ -81,6 +81,46 @@ rules:
     severity: MEDIUM
     is_active: true
 
+  - rule_id: RULE_JAILBREAK_04
+    rule_type: REGEX
+    category: JAILBREAK
+    pattern: '(?i)\b(?:you\s+are|act\s+as|pretend\s+to\s+be)\s+(?:an?\s+)?(?:unfiltered|uncensored|unrestricted)\s+(?:AI|assistant|model)\b|\b(?:answer|respond)\s+to\s+(?:every|all|any)\s+(?:question|request)s?\s+without\s+(?:any\s+)?(?:restrictions?|filters?)\b'
+    description: Unrestricted persona or blanket no-restrictions request
+    severity: HIGH
+    is_active: true
+
+  - rule_id: RULE_JAILBREAK_05
+    rule_type: REGEX
+    category: JAILBREAK
+    pattern: '(?i)\b(?:give|provide|generate)\s+(?:me\s+)?(?:two|2)\s+(?:responses?|answers?)\b.{0,80}\b(?:normal|safe|filtered)\b.{0,50}\b(?:unfiltered|uncensored|unrestricted)\b'
+    description: Requests paired safe and unfiltered answers
+    severity: HIGH
+    is_active: true
+
+  - rule_id: RULE_JAILBREAK_06
+    rule_type: REGEX
+    category: JAILBREAK
+    pattern: '(?i)\b(?:hypothetically|in\s+(?:a\s+)?fictional\s+scenario)\b.{0,120}\b(?:you\s+are|you''re|an?\s+(?:AI|assistant|model)\s+with)\b.{0,80}\b(?:no|without)\s+(?:any\s+)?restrictions?\b'
+    description: Hypothetical or fictional framing paired with unrestricted-assistant instructions
+    severity: HIGH
+    is_active: true
+
+  - rule_id: RULE_JAILBREAK_07
+    rule_type: REGEX
+    category: JAILBREAK
+    pattern: '(?i)\bnever\s+refuse\s+(?:any|all|a|the)\s+(?:requests?|questions?)\b'
+    description: Instruction to never refuse user requests
+    severity: HIGH
+    is_active: true
+
+  - rule_id: RULE_JAILBREAK_08
+    rule_type: REGEX
+    category: JAILBREAK
+    pattern: '(?i)\bactiva\s+el\s+modo\s+desarrollador\b|\bresponde\s+sin\s+filtros\b|\bpasse\s+en\s+mode\s+d[ée]veloppeur\b|\baktiviere\s+den\s+entwicklermodus\b|\battiva\s+la\s+modalit[àa]\s+sviluppatore\b'
+    description: Spanish, French, German and Italian developer-mode or filter-bypass phrases
+    severity: HIGH
+    is_active: true
+
   # --- PROMPT_LEAK -------------------------------------------------------
   - rule_id: RULE_PROMPT_LEAK_01
     rule_type: REGEX
@@ -198,4 +238,12 @@ rules:
     pattern: '\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b'
     description: JSON Web Token - three base64url parts separated by dots, starting with eyJ
     severity: HIGH
+    is_active: true
+
+  - rule_id: RULE_PII_SECRET_LABELED_01
+    rule_type: REGEX
+    category: PII
+    pattern: '(?i)\b(?:[A-Z0-9]+[_-])*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|AUTH[_-]?TOKEN|CLIENT[_-]?SECRET|SECRET[_-]?KEY|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|CREDENTIALS?|DATABASE[_-]?URL|CONNECTION[_-]?(?:STRING|URI)|(?:ENCRYPTION|SIGNING)[_-]?KEY)(?:[_-][A-Z0-9]+)*\b[*_`"]{0,3}\s*[:=]\s*[*_`"]{0,3}(?!your(?:[_-]|$)|example(?:[_-]|$)|sample(?:[_-]|$)|placeholder(?:[_-]|$)|redacted(?:[_-]|$)|changeme\b|replace[_-]?me\b|none\b|null\b|nil\b|true\b|false\b|x{8,}\b)[A-Za-z0-9][A-Za-z0-9._~+/=-]{11,}[*_`"]{0,3}'
+    description: Labeled credential or secret assignment with a non-placeholder value
+    severity: CRITICAL
     is_active: true

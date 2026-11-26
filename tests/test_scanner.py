@@ -288,13 +288,14 @@ class TestLeakDetection:
         assert elapsed < 0.5
 
     def test_long_system_instruction_warns_when_scan_is_truncated(self, monkeypatch, caplog):
-        monkeypatch.setattr(osc, "_system_truncation_warning_emitted", False)
         system = "x" * (osc.MAX_SYSTEM_CHARS + 1)
 
         with caplog.at_level(logging.WARNING, logger="firewall.output_scanner"):
             assert detect_system_prompt_leak("ordinary answer", system) == []
 
-        assert any("remainder is not checked" in record.message for record in caplog.records)
+        assert any(
+            "will NOT be detected" in record.message for record in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +393,23 @@ class TestDetectPii:
         spans = scan(text)
         assert spans and has_secret(spans)
 
+    @pytest.mark.parametrize(
+        "assignment",
+        [
+            "PAYMENTS_API_KEY: synthetic_live_key_7n2m",
+            '"AUTH_TOKEN": "synthetic_auth_token_8f4c"',
+            "DB_PASSWORD = synthetic_db_password_7a6c",
+            "SERVICE_CLIENT_SECRET: synthetic_client_secret_3p9x",
+        ],
+    )
+    def test_generic_labeled_credentials_are_secret_leaks(self, pii_rules, assignment):
+        spans = scan(assignment)
+        assert spans and has_secret(spans)
+
+    def test_generic_labeled_credential_rule_ignores_placeholders(self, pii_rules):
+        assert scan("API_KEY: placeholder") == []
+        assert scan("API_KEY: example_value") == []
+
     def test_matched_values_are_never_logged(self, pii_rules, caplog):
         caplog.set_level(logging.DEBUG, logger="firewall.output_scanner")
         text = "mail alice.example@example.com card 4111 1111 1111 1111 key " + SECRETS["aws"]
@@ -428,6 +446,10 @@ class TestSeededRules:
         "RULE_PII_SECRET_GOOGLE_01": ("k AIza" + "x" * 35, "k AIza short"),
         "RULE_PII_SECRET_PRIVKEY_01": ("-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN CERTIFICATE-----"),
         "RULE_PII_SECRET_JWT_01": ("t eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 12, "t eyJ.short"),
+        "RULE_PII_SECRET_LABELED_01": (
+            '"PAYMENTS_API_KEY": "synthetic_live_key_7n2m"',
+            "API_KEY: placeholder",
+        ),
     }
 
     def test_every_seeded_rule_has_samples(self):
@@ -444,6 +466,18 @@ class TestSeededRules:
     def test_invalid_regex_raises_a_clear_error_at_load_time(self):
         with pytest.raises(osc.OutputScannerRuleError):
             osc._compile_regex("RULE_PII_BAD_01", "([unclosed", 0)
+
+    def test_compiled_regex_cache_uses_updated_pattern(self):
+        old_pattern = osc._compile_regex(
+            "RULE_PII_CACHE_UPDATE_TEST", r"\bold-secret\b", 0
+        )
+        new_pattern = osc._compile_regex(
+            "RULE_PII_CACHE_UPDATE_TEST", r"\bnew-secret\b", 0
+        )
+
+        assert old_pattern.search("old-secret")
+        assert not new_pattern.search("old-secret")
+        assert new_pattern.search("new-secret")
 
 # ---------------------------------------------------------------------------
 # Review comment 1: system-prompt truncation is configurable, cached, never silent

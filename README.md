@@ -66,9 +66,9 @@ Your application keeps using its normal LLM SDK; only the base URL changes (see
 
 | Component | What it does |
 |---|---|
-| **Proxy** (`src/proxy/`) | Accepts `POST /v1/chat/completions`, runs the inspection, forwards cleared requests, returns a block response when denied. |
+| **Proxy** (`src/proxy/`) | Accepts `POST /v1/chat/completions`, runs the inspection, forwards cleared requests, returns a block response when denied. Rejects `n` above four choices. |
 | **Inspection pipeline** (`src/engine/pipeline.py`) | **Layer 1** deterministic rules (regex and keywords) → **Layer 2** local ONNX classifier (risk score) → **Layer 3** local reasoning model for uncertain prompts. If Layer 2 is disabled or unavailable, Layer 3 evaluates the prompt when enabled. Uncertain or unavailable Layer 2 results are blocked when Layer 3 is disabled. If both are deliberately disabled, Layer-1-clear prompts pass and the dashboard warns. |
-| **Output scanner** (`src/engine/output_scanner.py`) | Checks every returned choice for leaked system-prompt text, PII and secrets, then passes, redacts or blocks it. Warns once in the gateway log if a system instruction exceeds the scan limit. |
+| **Output scanner** (`src/engine/output_scanner.py`) | Checks every returned choice for leaked system-prompt text, PII and secrets. Secret findings are blocked; other findings follow `output_scanner.on_detect`. Warns once in the gateway log if a system instruction exceeds the scan limit. |
 | **Database** (`src/database/`) | PostgreSQL stores every decision, the rules, hourly metrics and audit records. Writes never slow a request down. |
 | **Dashboard** (`src/dashboard/`) | Streamlit app for analytics and log search. |
 | **ML assets** (`src/models/`) | The Layer 2 classifier and tokenizer, loaded from local disk. |

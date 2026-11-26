@@ -650,14 +650,22 @@ def test_layer2_unavailable_blocks_when_layer3_is_disabled(
     assert result.decision == "BLOCK"
 
 
-def test_output_scanner_reports_redact_action_with_spans(use_config, fake_detectors):
+def test_output_scanner_blocks_secret_spans(use_config, fake_detectors):
     use_config(PipelineConfig(output_on_detect="redact"))
     fake_detectors(pii=[Span(start=0, end=5, category="SECRET_LEAK")])
     result = scan_it()
     assert result.flagged is True
-    assert result.action == "REDACT"
+    assert result.action == "BLOCK"
     assert result.categories == ["SECRET_LEAK"]
     assert len(result.spans) == 1
+
+
+def test_output_scanner_keeps_configured_action_for_regular_pii(use_config, fake_detectors):
+    use_config(PipelineConfig(output_on_detect="redact"))
+    fake_detectors(pii=[Span(start=0, end=5, category="PII_LEAK")])
+    result = scan_it()
+    assert result.flagged is True
+    assert result.action == "REDACT"
 
 
 def test_output_scanner_disabled_in_config_skips_scan(use_config, fake_detectors):

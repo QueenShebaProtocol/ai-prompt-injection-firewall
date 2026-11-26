@@ -380,6 +380,7 @@ router = APIRouter()
 
 REQUEST_ID_HEADER = "X-Firewall-Request-Id"
 ACTION_HEADER = "X-Firewall-Action"
+MAX_COMPLETION_CHOICES = 4
 admission_controller = RequestAdmissionController.from_environment()
 
 
@@ -662,6 +663,15 @@ def _validate_body(body) -> tuple[str, str] | None:
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         return "invalid_request", "'messages' must be a non-empty list."
+
+    choice_count = body.get("n", 1)
+    if isinstance(choice_count, bool) or not isinstance(choice_count, int) or choice_count < 1:
+        return "invalid_n", "'n' must be a positive integer."
+    if choice_count > MAX_COMPLETION_CHOICES:
+        return (
+            "too_many_choices",
+            f"'n' cannot exceed {MAX_COMPLETION_CHOICES}.",
+        )
 
     if body.get("stream") is True:
         return (
