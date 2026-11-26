@@ -21,7 +21,13 @@ from src.dashboard.assets import (
     ICON_SHIELD,
     get_crest_data_uri,
 )
-from src.dashboard.session import REFRESH_COOKIE, get_cookie, saved_refresh_seconds, set_refresh_cookie, start_auto_refresh
+from src.dashboard.session import (
+    REFRESH_COOKIE,
+    get_cookie,
+    saved_refresh_seconds,
+    set_refresh_cookie,
+    start_auto_refresh,
+)
 
 logger = logging.getLogger("firewall.dashboard.sidebar")
 _ROOT = Path(__file__).resolve().parents[3]
@@ -36,7 +42,9 @@ def check_gateway_status() -> bool:
     ]
     for url in urls:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Sheba-Dashboard-Health"})
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Sheba-Dashboard-Health"}
+            )
             with urllib.request.urlopen(req, timeout=0.8) as resp:
                 if resp.status == 200:
                     return True
@@ -48,9 +56,9 @@ def check_gateway_status() -> bool:
 def check_db_status() -> bool:
     """Check if PostgreSQL is reachable."""
     try:
-        from src.database.connection import check_database_connection
-        from src.database.storage import run_sync
-        return bool(run_sync(check_database_connection()))
+        from src.database.storage import ping_database
+
+        return bool(run_sync(ping_database(), timeout=3))
     except Exception:
         return False
 
@@ -60,6 +68,7 @@ def get_blocked_count() -> int:
     """Return the count of blocked requests in the last 24 hours."""
     try:
         from src.database.storage import get_kpi_summary, run_sync
+
         summary = run_sync(get_kpi_summary(hours=24))
         return int(summary.get("blocked_requests", 0)) if summary else 0
     except Exception:
@@ -82,7 +91,9 @@ def check_system_services() -> dict[str, tuple[str, str]]:
     onnx_status = ("Loaded", "dot") if onnx_loaded else ("Offline", "dot off")
 
     # Layer 3 judge (check if Groq key or fallback configured)
-    has_api_key = bool(os.environ.get("GROQ_API_KEY") or os.environ.get("OPENAI_API_KEY"))
+    has_api_key = bool(
+        os.environ.get("GROQ_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    )
     l3_status = ("Active", "dot") if has_api_key else ("Degraded", "dot warn")
 
     return {
@@ -169,7 +180,11 @@ def render_sidebar(
         log_active = "active" if current_page == "logs" else ""
         cfg_active = "active" if current_page == "config" else ""
 
-        count_badge = f'<span class="count">{blocked_count}</span>' if blocked_count > 0 else '<span class="count">0</span>'
+        count_badge = (
+            f'<span class="count">{blocked_count}</span>'
+            if blocked_count > 0
+            else '<span class="count">0</span>'
+        )
 
         nav_html = f"""
         <nav class="nav" aria-label="Console pages">
@@ -193,8 +208,14 @@ def render_sidebar(
         refresh_seconds = st.selectbox(
             "Refresh interval",
             options=_refresh_options,
-            index=_refresh_options.index(_saved_refresh) if _saved_refresh in _refresh_options else 1,
-            format_func=lambda s: "Off" if s == 0 else (f"{s} seconds" if s < 60 else "1 minute"),
+            index=(
+                _refresh_options.index(_saved_refresh)
+                if _saved_refresh in _refresh_options
+                else 1
+            ),
+            format_func=lambda s: (
+                "Off" if s == 0 else (f"{s} seconds" if s < 60 else "1 minute")
+            ),
             key="side_refresh_seconds",
         )
 
