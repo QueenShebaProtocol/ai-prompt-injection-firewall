@@ -287,6 +287,15 @@ class TestLeakDetection:
         assert spans
         assert elapsed < 0.5
 
+    def test_long_system_instruction_warns_when_scan_is_truncated(self, monkeypatch, caplog):
+        monkeypatch.setattr(osc, "_system_truncation_warning_emitted", False)
+        system = "x" * (osc.MAX_SYSTEM_CHARS + 1)
+
+        with caplog.at_level(logging.WARNING, logger="firewall.output_scanner"):
+            assert detect_system_prompt_leak("ordinary answer", system) == []
+
+        assert any("remainder is not checked" in record.message for record in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # P2 Friday: luhn_ok, has_secret, detect_pii

@@ -350,6 +350,9 @@ def test_hot_reload_integration(tmp_path):
         "TARGET_LLM_API_KEY": "perf-fake-key",
         "RULES_POLL_SECONDS": str(RULES_POLL_S),
         "FIREWALL_RUNTIME_CONFIG_PATH": str(runtime_cfg),
+        "RATE_LIMIT_REQUESTS_PER_MINUTE": "100000",
+        "RATE_LIMIT_BURST": "10000",
+        "MAX_IN_FLIGHT_REQUESTS": "64",
     }
     log_path = tmp_path / "gateway.log"
     log_file = log_path.open("w")

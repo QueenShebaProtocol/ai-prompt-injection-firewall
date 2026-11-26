@@ -1753,6 +1753,11 @@ MASTER_CSS = """
   /* Mobile Top Navigation Header (hidden on desktop >=769px) */
   .mobile-nav-header {
     display: none !important;
+    visibility: visible !important;
+    height: auto !important;
+    min-height: 60px !important;
+    max-height: none !important;
+    pointer-events: auto !important;
     align-items: center;
     justify-content: space-between;
     gap: 12px;

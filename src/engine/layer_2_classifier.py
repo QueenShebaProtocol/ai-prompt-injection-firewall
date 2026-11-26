@@ -33,6 +33,9 @@ from collections import deque
 from dataclasses import dataclass
 
 _LATENCY_WINDOW_SIZE = 1000
+_count_tokenizer_lock = threading.Lock()
+_count_tokenizer = None
+_count_tokenizer_path: str | None = None
 
 
 class ClassifierUnavailable(RuntimeError):
@@ -52,6 +55,40 @@ def _settings() -> dict:
         "max_length": int(os.getenv("L2_MAX_LENGTH", "512")),
         "label_index": int(os.getenv("L2_INJECTION_LABEL_INDEX", "1")),
     }
+
+
+def count_prompt_tokens(text: str) -> int:
+    """Count with the same tokenizer used by Layer 2, even when its model is off."""
+    global _count_tokenizer, _count_tokenizer_path
+
+    classifier = get_classifier()
+    tokenizer = classifier._tokenizer
+    if tokenizer is None:
+        settings = _settings()
+        tokenizer_path = os.path.join(settings["tokenizer_dir"], "tokenizer.json")
+        with _count_tokenizer_lock:
+            if _count_tokenizer is None or _count_tokenizer_path != tokenizer_path:
+                if not os.path.isfile(tokenizer_path):
+                    raise ClassifierUnavailable(
+                        f"Tokenizer file not found: {tokenizer_path}"
+                    )
+                try:
+                    from tokenizers import Tokenizer
+
+                    _count_tokenizer = Tokenizer.from_file(tokenizer_path)
+                except Exception as exc:
+                    raise ClassifierUnavailable(
+                        f"Could not load tokenizer for request limits: {exc}"
+                    ) from exc
+                _count_tokenizer_path = tokenizer_path
+            tokenizer = _count_tokenizer
+
+    try:
+        return len(tokenizer.encode(text).ids)
+    except Exception as exc:
+        raise ClassifierUnavailable(
+            f"Could not count request tokens: {type(exc).__name__}"
+        ) from exc
 
 
 class Layer2Classifier:

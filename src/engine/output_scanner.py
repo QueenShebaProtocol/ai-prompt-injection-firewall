@@ -7,13 +7,13 @@ from __future__ import annotations
 import copy
 import logging
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Mapping, Sequence
 
 import hashlib
-import threading
 import time
 from collections import OrderedDict
 
@@ -147,6 +147,16 @@ _WORD_RE = re.compile(r"\w+")
 
 SYSTEM_PROMPT_LEAK = "SYSTEM_PROMPT_LEAK"
 
+# Scan limits (keeps the detector fast and its cost predictable).
+# Only the first MAX_COMPLETION_CHARS characters of a completion are scanned,
+# so a leak that starts after that point is not detected.
+# Only the first MAX_SYSTEM_CHARS characters of the system instruction are used.
+DEFAULT_MAX_SYSTEM_CHARS = 1_000_000
+DEFAULT_MAX_COMPLETION_CHARS = 200_000
+MAX_SYSTEM_CHARS = DEFAULT_MAX_SYSTEM_CHARS          # kept for old imports
+MAX_COMPLETION_CHARS = DEFAULT_MAX_COMPLETION_CHARS 
+
+
 # Scan limits. They protect the firewall itself from absurd inputs; they are
 # NOT meant to be hit by normal traffic.
 #
@@ -158,10 +168,7 @@ SYSTEM_PROMPT_LEAK = "SYSTEM_PROMPT_LEAK"
 # set in config/firewall.yaml (output_scanner.*) and passed in by scan_output().
 # Exceeding either limit is never silent: it is logged and reported through
 # the `truncated` flags.
-DEFAULT_MAX_SYSTEM_CHARS = 1_000_000
-DEFAULT_MAX_COMPLETION_CHARS = 200_000
-MAX_SYSTEM_CHARS = DEFAULT_MAX_SYSTEM_CHARS          # kept for old imports
-MAX_COMPLETION_CHARS = DEFAULT_MAX_COMPLETION_CHARS  # kept for old imports
+
 
 _SHINGLE_CACHE_SIZE = 16     # distinct system prompts kept in memory
 _WARNED_MAX = 256

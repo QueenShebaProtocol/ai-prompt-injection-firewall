@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import pandas as pd
+import httpx
 import streamlit as st
 
 from src.dashboard.assets import get_crest_data_uri
@@ -29,6 +31,7 @@ from src.dashboard.components.metrics_cards import render_overview_kpis
 from src.dashboard.components.pipeline import render_inspection_pipeline
 from src.dashboard.components.sidebar import render_sidebar
 from src.dashboard.styles import inject_theme
+from src.engine.pipeline import get_pipeline_config
 from src.database.storage import (
     LogFilters,
     get_active_layer1_rules,
@@ -42,6 +45,26 @@ from src.database.storage import (
 
 logger = logging.getLogger("firewall.dashboard.app")
 
+
+def _gateway_security_warning() -> tuple[bool, str | None]:
+    status_url = os.getenv("FIREWALL_STATUS_URL", "http://127.0.0.1:8000/")
+    try:
+        response = httpx.get(status_url, timeout=1.0)
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPError as exc:
+        logger.warning("Could not retrieve gateway security status: %s", type(exc).__name__)
+        return False, None
+    except ValueError:
+        logger.warning("Gateway security status response was not valid JSON.")
+        return False, None
+    if not isinstance(payload, dict):
+        logger.warning("Gateway security status response was not a JSON object.")
+        return False, None
+    warning = payload.get("security_warning")
+    return True, warning if isinstance(warning, str) and warning else None
+
+
 st.set_page_config(
     page_title="SHEBA Shield — AI Prompt Injection Firewall Console",
     page_icon=None,
@@ -54,6 +77,21 @@ inject_theme()
 
 # Render shared sidebar
 settings = render_sidebar(current_page="overview")
+
+# Make deliberate low-protection configurations visible on the main dashboard.
+pipeline_config = get_pipeline_config()
+gateway_status_available, gateway_warning = _gateway_security_warning()
+if gateway_warning:
+    if not pipeline_config.firewall_enabled:
+        st.error(gateway_warning)
+    else:
+        st.warning(gateway_warning)
+elif not gateway_status_available:
+    st.warning("Gateway runtime security status could not be verified; check the gateway health and logs.")
+elif not pipeline_config.firewall_enabled:
+    st.error("Firewall inspection is disabled. Prompts and completions bypass security scanning.")
+elif not pipeline_config.layer_2_enabled and not pipeline_config.layer_3_enabled:
+    st.warning("Only Layer 1 is enabled. Prompts that do not match a deterministic rule will pass.")
 
 # ------------------------------------------------------------- Topbar
 refresh_sec = settings.get("refresh_seconds", 30)

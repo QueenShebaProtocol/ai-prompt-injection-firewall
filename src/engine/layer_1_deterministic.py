@@ -10,12 +10,34 @@ this same file on Friday by P6. It is not part of this Wednesday task.
 """
 
 import asyncio
+import base64
+import binascii
 import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from urllib.parse import unquote, unquote_plus
 
 logger = logging.getLogger("firewall.layer1")
+
+_BASE64_RE = re.compile(r"(?<![\w+/_-])[A-Za-z0-9+/_-]{16,}={0,2}(?![\w+/_=-])")
+_HEX_RE = re.compile(r"(?<![A-Fa-f0-9])(?:[A-Fa-f0-9]{2}){8,}(?![A-Fa-f0-9])")
+_LEET_TRANSLATION = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t"})
+_ROT13_TRANSLATION = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+    "NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcdefghijklm",
+)
+_LOOKALIKE_TRANSLATION = str.maketrans({
+    "\u0430": "a", "\u0410": "A", "\u0435": "e", "\u0415": "E",
+    "\u043e": "o", "\u041e": "O", "\u0440": "p", "\u0420": "P",
+    "\u0441": "c", "\u0421": "C", "\u0445": "x", "\u0425": "X",
+    "\u0443": "y", "\u0423": "Y", "\u0456": "i", "\u0406": "I",
+    "\u0458": "j", "\u0408": "J", "\u03b1": "a", "\u0391": "A",
+    "\u03b5": "e", "\u0395": "E", "\u03bf": "o", "\u039f": "O",
+    "\u03c1": "p", "\u03a1": "P", "\u03b9": "i", "\u0399": "I",
+    "\u03ba": "k", "\u039a": "K", "\u03bd": "v", "\u039d": "N",
+    "\u03c4": "t", "\u03a4": "T", "\u03c7": "x", "\u03a7": "X",
+})
 
 
 @dataclass
@@ -56,6 +78,8 @@ class Layer1Engine:
         compiled_rules: list[dict] = []
 
         for rule in rules:
+            if (rule.get("category") or "").upper() == "PII":
+                continue
             entry = dict(rule)
 
             if rule["rule_type"] == "REGEX":
@@ -163,13 +187,78 @@ class Layer1Engine:
     def _normalize(text: str) -> str:
         """
         NFKC-normalize (folds full-width and many homoglyph forms to
-        their plain equivalents) and collapse repeated whitespace, so
-        simple obfuscation doesn't slip past the rules.
+        their plain equivalents), remove invisible format characters,
+        and collapse repeated whitespace.
         """
         if not text:
             return ""
         normalized = unicodedata.normalize("NFKC", text)
+        normalized = "".join(
+            char for char in normalized
+            if unicodedata.category(char) != "Cf"
+        )
         return re.sub(r"\s+", " ", normalized).strip()
+
+    @classmethod
+    def _inspection_variants(cls, text: str) -> tuple[list[str], bool]:
+        """Return bounded decoded/normalized views and whether a large blob was found."""
+        normalized = cls._normalize(text)
+        variants = [text]
+        seen = {text}
+        large_encoded_blob = False
+
+        def add(value: str) -> None:
+            value = cls._normalize(value)
+            if value and value not in seen:
+                seen.add(value)
+                variants.append(value)
+
+        add(normalized)
+        spaced_invisibles = cls._normalize("".join(
+            " " if unicodedata.category(char) == "Cf" else char
+            for char in unicodedata.normalize("NFKC", text)
+        ))
+        add(spaced_invisibles)
+        add(normalized.translate(_LOOKALIKE_TRANSLATION))
+
+        for decoder in (unquote, unquote_plus):
+            decoded_url = normalized
+            for _ in range(2):
+                next_url = decoder(decoded_url)
+                if next_url == decoded_url:
+                    break
+                decoded_url = next_url
+                add(decoded_url)
+
+        primary_variants = tuple(variants)
+        for source in primary_variants:
+            for match in _BASE64_RE.finditer(source):
+                token = match.group()
+                if len(token) >= 256:
+                    large_encoded_blob = True
+                padded = token + "=" * (-len(token) % 4)
+                try:
+                    raw = base64.b64decode(padded, altchars=b"-_", validate=True)
+                    decoded = raw.decode("utf-8")
+                except (binascii.Error, UnicodeDecodeError, ValueError):
+                    continue
+                if decoded and all(char.isprintable() or char.isspace() for char in decoded):
+                    add(decoded)
+
+            for match in _HEX_RE.finditer(source):
+                token = match.group()
+                if len(token) >= 256:
+                    large_encoded_blob = True
+                try:
+                    decoded = bytes.fromhex(token).decode("utf-8")
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if decoded and all(char.isprintable() or char.isspace() for char in decoded):
+                    add(decoded)
+
+            add(source.translate(_ROT13_TRANSLATION))
+            add(source.translate(_LEET_TRANSLATION))
+        return variants, large_encoded_blob
 
     def evaluate(self, prompt: str, system_instruction: str = "") -> Layer1MatchResult:
         """
@@ -177,23 +266,34 @@ class Layer1Engine:
         active Layer 1 rules. Returns on the first match — short-circuit,
         per FR-L1-03 — rather than collecting every match.
         """
-        text = self._normalize(f"{prompt or ''} {system_instruction or ''}")
-        text_lower = text.lower()
+        text = f"{prompt or ''} {system_instruction or ''}"
+        variants, large_encoded_blob = self._inspection_variants(text)
 
-        for rule in self._rules:
-            if rule["rule_type"] == "REGEX":
-                hit = rule["compiled"].search(text) is not None
-            else:  # KEYWORD
-                hit = rule["keyword_lower"] in text_lower
+        if large_encoded_blob:
+            return Layer1MatchResult(
+                matched=True,
+                rule_id="RULE_ENCODED_BLOB_01",
+                category="ENCODED_CONTENT",
+                severity="HIGH",
+                patterns=["RULE_ENCODED_BLOB_01"],
+            )
 
-            if hit:
-                return Layer1MatchResult(
-                    matched=True,
-                    rule_id=rule["rule_id"],
-                    category=rule["category"],
-                    severity=rule["severity"],
-                    patterns=[rule["rule_id"]],
-                )
+        for variant in variants:
+            variant_lower = variant.lower()
+            for rule in self._rules:
+                if rule["rule_type"] == "REGEX":
+                    hit = rule["compiled"].search(variant) is not None
+                else:  # KEYWORD
+                    hit = rule["keyword_lower"] in variant_lower
+
+                if hit:
+                    return Layer1MatchResult(
+                        matched=True,
+                        rule_id=rule["rule_id"],
+                        category=rule["category"],
+                        severity=rule["severity"],
+                        patterns=[rule["rule_id"]],
+                    )
 
         return Layer1MatchResult(matched=False)
 

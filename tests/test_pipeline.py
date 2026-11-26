@@ -242,10 +242,11 @@ def test_classifier_called_exactly_once_per_request(l1_rules, fake_clf):
 
 
 # ======================================================================
-# 3. Degraded mode: Layer 2 unavailable falls back to Layer 1 only
+# 3. Degraded mode: Layer 2 unavailable escalates to Layer 3 when enabled
 # ======================================================================
-def test_model_not_loaded_degrades_to_layer1_only(l1_rules, fake_clf, caplog):
+def test_model_not_loaded_escalates_to_layer3(l1_rules, fake_clf, l3_answer, caplog):
     fake = fake_clf(loaded=False)
+    calls = l3_answer("ALLOW")
     with caplog.at_level(logging.WARNING):
         r = run_it(BENIGN_PROMPT)
 
@@ -253,8 +254,10 @@ def test_model_not_loaded_degrades_to_layer1_only(l1_rules, fake_clf, caplog):
     assert r.is_blocked is False
     assert r.layer2_score is None
     assert fake.calls == []
+    assert calls == [BENIGN_PROMPT]
     assert r.layer_details["layer_2"]["status"] == "unavailable"
     assert r.layer_details["layer_2"]["reason"] == "model_not_loaded"
+    assert r.layer_details["layer_3"]["decision"] == "ALLOW"
     assert any("not loaded" in rec.message for rec in caplog.records)
 
 
@@ -266,33 +269,60 @@ def test_degraded_mode_still_blocks_on_layer1(l1_rules, fake_clf):
     assert r.triggered_layer == "LAYER_1"
 
 
-def test_classifier_unavailable_error_degrades(l1_rules, fake_clf):
+def test_classifier_unavailable_error_escalates_to_layer3(l1_rules, fake_clf, l3_answer):
     fake_clf(error=ClassifierUnavailable("bad score"))
+    calls = l3_answer("ALLOW")
     r = run_it(BENIGN_PROMPT)
 
     assert r.decision == "PASS"
     assert r.layer2_score is None
     assert r.layer_details["layer_2"]["status"] == "error"
     assert "bad score" in r.layer_details["layer_2"]["reason"]
+    assert calls == [BENIGN_PROMPT]
+    assert r.layer_details["layer_3"]["decision"] == "ALLOW"
 
 
-def test_unexpected_error_degrades(l1_rules, fake_clf):
+def test_unexpected_error_escalates_to_layer3(l1_rules, fake_clf, l3_answer):
     fake_clf(error=RuntimeError("boom"))
+    calls = l3_answer("ALLOW")
     r = run_it(BENIGN_PROMPT)
 
     assert r.decision == "PASS"
     assert r.layer_details["layer_2"]["status"] == "error"
     assert r.layer_details["layer_2"]["reason"] == "unexpected_error"
+    assert calls == [BENIGN_PROMPT]
+    assert r.layer_details["layer_3"]["decision"] == "ALLOW"
 
 
-def test_layer2_disabled_in_config(l1_rules, fake_clf, use_config):
+def test_layer2_disabled_in_config_routes_to_layer3(l1_rules, fake_clf, l3_answer, use_config):
     use_config(PipelineConfig(layer_2_enabled=False))
     fake = fake_clf(score=0.99)
+    calls = l3_answer("ALLOW")
     r = run_it(BENIGN_PROMPT)
 
     assert r.decision == "PASS"
     assert fake.calls == []
-    assert "layer_2" not in r.layer_details
+    assert calls == [BENIGN_PROMPT]
+    assert r.layer_details["layer_2"] == {"status": "disabled"}
+    assert r.layer_details["layer_3"]["decision"] == "ALLOW"
+
+
+def test_layer2_and_layer3_disabled_leaves_layer1_only(
+    l1_rules, fake_clf, l3_answer, use_config
+):
+    use_config(PipelineConfig(layer_2_enabled=False, layer_3_enabled=False))
+    fake = fake_clf(score=0.99)
+    calls = l3_answer("BLOCK")
+    result = run_it(BENIGN_PROMPT)
+
+    assert fake.calls == []
+    assert calls == []
+    assert result.decision == "PASS"
+    assert result.layer_details["layer_2"] == {"status": "disabled"}
+    assert result.layer_details["layer_3"] == {"status": "disabled"}
+    blocked = run_it(JAILBREAK_PROMPT)
+    assert blocked.is_blocked is True
+    assert blocked.triggered_layer == "LAYER_1"
 
 
 # ======================================================================
@@ -583,15 +613,41 @@ def test_layer3_degraded_fallback_decision_is_applied(
     assert result.layer_details["layer_3"]["degraded"] is True
 
 
-def test_layer3_disabled_in_config_skips_layer3(l1_rules, fake_clf, l3_answer, use_config):
+def test_uncertain_layer2_score_blocks_when_layer3_disabled(
+    l1_rules, fake_clf, l3_answer, use_config
+):
     use_config(PipelineConfig(layer_3_enabled=False))
     fake_clf(score=AMBIGUOUS_SCORE)
     calls = l3_answer("BLOCK")
     result = run_it(BENIGN_PROMPT)
+
     assert calls == []
-    assert result.layer_details["layer_3"] == {"status": "disabled"}
-    assert result.is_blocked is False
-    assert result.decision == "PASS"
+    assert result.layer_details["layer_3"] == {
+        "status": "disabled",
+        "reason": "layer_2_uncertain",
+    }
+    assert result.is_blocked is True
+    assert result.action_taken == "BLOCKED"
+    assert result.triggered_layer == "LAYER_2"
+    assert result.decision == "BLOCK"
+
+
+def test_layer2_unavailable_blocks_when_layer3_is_disabled(
+    l1_rules, fake_clf, l3_answer, use_config
+):
+    use_config(PipelineConfig(layer_3_enabled=False))
+    fake_clf(loaded=False)
+    calls = l3_answer("ALLOW")
+    result = run_it(BENIGN_PROMPT)
+
+    assert calls == []
+    assert result.layer_details["layer_3"] == {
+        "status": "disabled",
+        "reason": "layer_2_unavailable",
+    }
+    assert result.is_blocked is True
+    assert result.triggered_layer == "LAYER_2"
+    assert result.decision == "BLOCK"
 
 
 def test_output_scanner_reports_redact_action_with_spans(use_config, fake_detectors):

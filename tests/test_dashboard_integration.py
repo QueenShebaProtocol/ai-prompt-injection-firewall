@@ -48,6 +48,14 @@ def test_master_css_contains_design_system():
     assert ".badge" in MASTER_CSS
 
 
+def test_mobile_navigation_header_overrides_hidden_streamlit_header():
+    mobile_header_css = MASTER_CSS.split(".mobile-nav-header {", 1)[1].split("}", 1)[0]
+
+    assert "visibility: visible !important;" in mobile_header_css
+    assert "height: auto !important;" in mobile_header_css
+    assert "min-height: 60px !important;" in mobile_header_css
+
+
 def test_crest_asset_loaded():
     uri = get_crest_data_uri()
     assert uri.startswith("data:image/png;base64,")

@@ -6,8 +6,9 @@ Startup order:
   2. Verify the database, create the schema, load Layer 1 rules.
   3. Start the Layer 1 rule hot-reload watcher.
   4. Load and warm up the Layer 2 classifier (if enabled). If the model files
-     are missing or broken, log it and carry on: the pipeline then runs on
-     Layer 1 only.
+     are missing or broken, log it and carry on: the pipeline uses Layer 3
+     when enabled, and blocks if Layer 3 is disabled. If both layers are
+     deliberately disabled, Layer-1-clear prompts pass with a dashboard warning.
   5. Start the hourly system_metrics rollup as a background task.
 Shutdown reverses this and cancels the background tasks.
 """
@@ -60,7 +61,7 @@ async def _load_layer1_rules() -> None:
 
 async def _load_layer2() -> None:
     """Load and warm up Layer 2. Never raises: a Layer 2 problem must not stop
-    the gateway from starting, because the pipeline falls back to Layer 1."""
+    the gateway from starting, because the pipeline can use Layer 3 instead."""
     classifier = get_classifier()
     try:
         # Both calls are blocking (disk + CPU), so keep them off the event loop.
@@ -69,9 +70,11 @@ async def _load_layer2() -> None:
         await asyncio.to_thread(classifier.warm_up)
         logger.info("Layer 2 classifier warmed up.")
     except ClassifierUnavailable as exc:
-        logger.error("Layer 2 unavailable, running on Layer 1 only: %s", exc)
+        logger.error("Layer 2 unavailable; Layer 3 will evaluate prompts when enabled: %s", exc)
     except Exception:
-        logger.exception("Unexpected error starting Layer 2, running on Layer 1 only.")
+        logger.exception(
+            "Unexpected error starting Layer 2; Layer 3 will evaluate prompts when enabled."
+        )
 
 
 @asynccontextmanager
@@ -129,9 +132,33 @@ app.include_router(proxy_router)
 async def root():
     cfg = get_pipeline_config()
     layer2 = get_classifier().status()
+    layer1_active = cfg.layer_1_enabled and layer1_engine.rule_count > 0
+    security_warning = None
+    if not cfg.firewall_enabled:
+        security_warning = "Firewall inspection is disabled; requests bypass input and output scanning."
+    elif not layer1_active and not cfg.layer_2_enabled and not cfg.layer_3_enabled:
+        security_warning = "No input inspection layers are enabled."
+    elif not cfg.layer_2_enabled and not cfg.layer_3_enabled:
+        security_warning = (
+            "Only Layer 1 can inspect prompts; Layer 2 and Layer 3 are disabled."
+            if layer1_active
+            else "No input inspection layers are active."
+        )
+    elif cfg.layer_2_enabled and not layer2["loaded"] and not cfg.layer_3_enabled:
+        security_warning = (
+            "Layer 2 is unavailable and Layer 3 is disabled; prompts not blocked by Layer 1 are rejected."
+            if layer1_active
+            else "Prompt inspection is unavailable; requests are rejected because Layer 2 is unavailable and Layer 3 is disabled."
+        )
+    elif cfg.layer_2_enabled and not layer2["loaded"]:
+        security_warning = "Layer 2 is unavailable; prompts are being evaluated by Layer 3 instead."
+    elif not cfg.layer_2_enabled and cfg.layer_3_enabled:
+        security_warning = "Layer 2 is disabled; prompts that pass Layer 1 are evaluated by Layer 3."
+    elif cfg.layer_2_enabled and not cfg.layer_3_enabled:
+        security_warning = "Layer 3 is disabled; uncertain Layer 2 results are blocked."
 
     active_layers = []
-    if cfg.layer_1_enabled and layer1_engine.rule_count > 0:   # enabled AND has rules
+    if layer1_active:
         active_layers.append("LAYER_1")
     if cfg.layer_2_enabled and layer2["loaded"]:      # enabled AND actually running
         active_layers.append("LAYER_2")
@@ -145,4 +172,5 @@ async def root():
         "active_layers": active_layers,
         "layer1_rules_loaded": layer1_engine.rule_count,
         "layer2": {"enabled": cfg.layer_2_enabled, **layer2},
+        "security_warning": security_warning,
     }
