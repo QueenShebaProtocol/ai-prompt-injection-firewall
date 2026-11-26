@@ -74,6 +74,31 @@ def test_prompt_token_limit_fails_closed_when_tokenizer_is_unavailable(monkeypat
     assert json.loads(response.body)["error"]["code"] == "prompt_limit_unavailable"
 
 
+def test_request_validation_accepts_up_to_four_choices():
+    assert handler._validate_body({
+        "messages": [{"role": "user", "content": "hello"}],
+        "n": 4,
+    }) is None
+
+
+def test_request_validation_rejects_more_than_four_choices():
+    error = handler._validate_body({
+        "messages": [{"role": "user", "content": "hello"}],
+        "n": 5,
+    })
+
+    assert error == ("too_many_choices", "'n' cannot exceed 4.")
+
+
+def test_request_validation_rejects_non_positive_or_non_integer_choice_count():
+    for choice_count in (0, -1, 1.5, True, "2"):
+        error = handler._validate_body({
+            "messages": [{"role": "user", "content": "hello"}],
+            "n": choice_count,
+        })
+        assert error == ("invalid_n", "'n' must be a positive integer.")
+
+
 def test_output_scan_covers_and_redacts_every_choice(monkeypatch):
     scanned = []
 

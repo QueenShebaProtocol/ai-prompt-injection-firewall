@@ -37,6 +37,7 @@ from src.engine.output_scanner import (
     detect_pii,
     detect_system_prompt_leak,
     detect_system_prompt_leak_ex,
+    has_secret,
 )
 
 logger = logging.getLogger(__name__)
@@ -596,7 +597,12 @@ async def scan_output(
     spans.sort(key=lambda sp: (sp.start, sp.end))
     flagged = bool(spans)
     categories = sorted({sp.category for sp in spans})
-    action = cfg.output_on_detect.upper() if flagged else "PASS"
+    if not flagged:
+        action = "PASS"
+    elif has_secret(spans):
+        action = "BLOCK"
+    else:
+        action = cfg.output_on_detect.upper()
 
     # Fail closed on an incomplete check, if the operator asked for it.
     if leak.truncated and cfg.output_on_truncate == "block":
