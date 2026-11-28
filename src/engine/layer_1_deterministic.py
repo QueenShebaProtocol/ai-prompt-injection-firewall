@@ -12,8 +12,9 @@ this same file on Friday by P6. It is not part of this Wednesday task.
 import asyncio
 import logging
 import re
-import unicodedata
 from dataclasses import dataclass, field
+
+from src.engine.preprocess import PreprocessResult, normalize_text, preprocess
 
 logger = logging.getLogger("firewall.layer1")
 
@@ -26,6 +27,9 @@ class Layer1MatchResult:
     category: str | None = None
     severity: str | None = None
     patterns: list[str] = field(default_factory=list)
+    # Which view of the prompt matched: "original", or e.g. "decoded_base64",
+    # "rot13", "folded" when the attack was hidden by an encoding.
+    via: str | None = None
 
 
 class Layer1Engine:
@@ -162,38 +166,52 @@ class Layer1Engine:
     @staticmethod
     def _normalize(text: str) -> str:
         """
-        NFKC-normalize (folds full-width and many homoglyph forms to
-        their plain equivalents) and collapse repeated whitespace, so
-        simple obfuscation doesn't slip past the rules.
+        NFKC-normalize (folds full-width and many homoglyph forms to their
+        plain equivalents), remove invisible characters (zero-width space and
+        joiners, bidi marks, ...) and collapse repeated whitespace, so simple
+        obfuscation doesn't slip past the rules.
         """
-        if not text:
-            return ""
-        normalized = unicodedata.normalize("NFKC", text)
-        return re.sub(r"\s+", " ", normalized).strip()
+        return normalize_text(text)
 
-    def evaluate(self, prompt: str, system_instruction: str = "") -> Layer1MatchResult:
+    def evaluate(
+        self,
+        prompt: str,
+        system_instruction: str = "",
+        pre: PreprocessResult | None = None,
+    ) -> Layer1MatchResult:
         """
         Evaluate a prompt (and optional system instruction) against all
-        active Layer 1 rules. Returns on the first match — short-circuit,
-        per FR-L1-03 — rather than collecting every match.
+        active Layer 1 rules. Returns on the first match - short-circuit,
+        per FR-L1-03 - rather than collecting every match.
+
+        The prompt is scanned as normalised text AND in every extra view the
+        pre-processor derives from it (decoded Base64 / hex / URL / escape
+        blobs, ROT13, reversed, folded lookalikes, leetspeak, spaced letters).
+        Pass ``pre`` to reuse a pre-processing result the caller already has
+        (it then replaces ``prompt`` and ``system_instruction``).
         """
-        text = self._normalize(f"{prompt or ''} {system_instruction or ''}")
-        text_lower = text.lower()
+        if pre is None:
+            pre = preprocess(f"{prompt or ''} {system_instruction or ''}")
 
-        for rule in self._rules:
-            if rule["rule_type"] == "REGEX":
-                hit = rule["compiled"].search(text) is not None
-            else:  # KEYWORD
-                hit = rule["keyword_lower"] in text_lower
+        for label, text in pre.all_texts():
+            if not text:
+                continue
+            text_lower = text.lower()
+            for rule in self._rules:
+                if rule["rule_type"] == "REGEX":
+                    hit = rule["compiled"].search(text) is not None
+                else:  # KEYWORD
+                    hit = rule["keyword_lower"] in text_lower
 
-            if hit:
-                return Layer1MatchResult(
-                    matched=True,
-                    rule_id=rule["rule_id"],
-                    category=rule["category"],
-                    severity=rule["severity"],
-                    patterns=[rule["rule_id"]],
-                )
+                if hit:
+                    return Layer1MatchResult(
+                        matched=True,
+                        rule_id=rule["rule_id"],
+                        category=rule["category"],
+                        severity=rule["severity"],
+                        patterns=[rule["rule_id"]],
+                        via=label,
+                    )
 
         return Layer1MatchResult(matched=False)
 

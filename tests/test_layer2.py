@@ -368,6 +368,7 @@ def make_recording_classifier(input_names=("input_ids", "attention_mask"), token
 def test_predict_sends_truncated_head_and_tail_to_the_model():
     clf, session = make_recording_classifier(tokenizer=FakeLongTokenizer())
     clf.max_length = 6
+    clf.long_prompt_mode = "truncate"  # legacy mode; the default is now "windows"
     clf.predict("a very long prompt")
     assert session.last_feeds["input_ids"].tolist() == [[0, 1, 2, 17, 18, 19]]
     assert session.last_feeds["attention_mask"].shape == (1, 6)

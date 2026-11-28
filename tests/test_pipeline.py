@@ -292,7 +292,7 @@ def test_layer2_disabled_in_config(l1_rules, fake_clf, use_config):
 
     assert r.decision == "PASS"
     assert fake.calls == []
-    assert "layer_2" not in r.layer_details
+    assert r.layer_details["layer_2"] == {"status": "disabled"}  # recorded, never silent
 
 
 # ======================================================================

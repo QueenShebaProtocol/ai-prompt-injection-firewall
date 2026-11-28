@@ -32,6 +32,7 @@ from src.engine.layer_1_deterministic import layer1_engine
 from src.engine import output_scanner as _output_scanner_module
 from src.engine.layer_2_classifier import ClassifierUnavailable, get_classifier
 from src.engine.layer_3_evaluator import Layer3Result, evaluate_layer3
+from src.engine.preprocess import PreprocessResult, preprocess
 from src.engine.output_scanner import (
     OutputScanResult,
     detect_pii,
@@ -51,6 +52,9 @@ class PipelineConfigError(ValueError):
 OUTPUT_ON_DETECT_CHOICES = frozenset({"block", "redact", "warn"})
 
 OUTPUT_ON_TRUNCATE_CHOICES = frozenset({"warn", "block"})
+# What to do with a prompt when Layer 2 is ENABLED but cannot run (model missing
+# or crashed): escalate = ask Layer 3, block = fail closed, pass = legacy behaviour.
+LAYER2_ON_UNAVAILABLE_CHOICES = frozenset({"escalate", "block", "pass"})
 MIN_SCAN_CHARS = 1000
 
 
@@ -69,6 +73,7 @@ class PipelineConfig:
     output_max_system_chars: int = 1_000_000
     output_max_completion_chars: int = 200_000
     output_on_truncate: str = "warn"       # warn | block
+    layer_2_on_unavailable: str = "escalate"  # escalate | block | pass
 
 
     def __post_init__(self):
@@ -96,6 +101,11 @@ class PipelineConfig:
             raise PipelineConfigError(
                 f"output_scanner.max_system_chars and max_completion_chars "
                 f"must be at least {MIN_SCAN_CHARS}."
+            )
+        if self.layer_2_on_unavailable not in LAYER2_ON_UNAVAILABLE_CHOICES:
+            raise PipelineConfigError(
+                f"layer_2.on_unavailable must be one of "
+                f"{sorted(LAYER2_ON_UNAVAILABLE_CHOICES)}, got {self.layer_2_on_unavailable!r}"
             )
         if self.output_on_truncate not in OUTPUT_ON_TRUNCATE_CHOICES:
             raise PipelineConfigError(
@@ -234,6 +244,9 @@ def load_pipeline_config(path, runtime_path=None) -> PipelineConfig:
         output_max_system_chars=_get_number(scanner, "max_system_chars", d.output_max_system_chars, int),
         output_max_completion_chars=_get_number(scanner, "max_completion_chars", d.output_max_completion_chars, int),
         output_on_truncate=_get_choice(scanner, "on_truncate", d.output_on_truncate, OUTPUT_ON_TRUNCATE_CHOICES),
+        layer_2_on_unavailable=_get_choice(
+            layer2, "on_unavailable", d.layer_2_on_unavailable, LAYER2_ON_UNAVAILABLE_CHOICES
+        ),
     )
 
 _config: PipelineConfig | None = None
@@ -364,34 +377,109 @@ def _decide(score: float, cfg: PipelineConfig) -> str:
     return "ESCALATE"
 
 
-async def _run_layer2(prompt, context, cfg, layer_details) -> float | None:
-    """Return the score, or None if Layer 2 could not run (degraded mode)."""
+_L2_MAX_EXTRA_VIEWS = 3   # decoded views classified in addition to the prompt itself
+
+
+async def _run_layer2(prompt, context, cfg, layer_details, pre: PreprocessResult | None = None) -> float | None:
+    """Return the score, or None if Layer 2 could not run (degraded mode).
+
+    The prompt is classified, and so is the decoded text of any Base64 / hex /
+    URL / escape blob found in it (at most _L2_MAX_EXTRA_VIEWS views), so a
+    payload hidden by an encoding is judged by the model as well. The score is
+    the highest of them.
+    """
     clf = get_classifier()
     if not clf.is_loaded:
-        logger.warning("Layer 2 is enabled but the classifier is not loaded; "
-                       "continuing with Layer 1 only.")
+        logger.warning("Layer 2 is enabled but the classifier is not loaded.")
         layer_details["layer_2"] = {"status": "unavailable", "reason": "model_not_loaded"}
         return None
 
     text, turns_used = _build_layer2_text(prompt, context, cfg)
     try:
         res = await clf.predict_async(text)
+        score, windows, skipped = res.score, getattr(res, "windows", 1), getattr(res, "windows_skipped", False)
+        latency = res.latency_ms
+        scored_views = []
+        if pre is not None:
+            decoded = [(lbl, t) for lbl, t in pre.variants if lbl.startswith("decoded_") and not lbl.endswith("_folded")]
+            for lbl, t in decoded[:_L2_MAX_EXTRA_VIEWS]:
+                extra = await clf.predict_async(t)
+                latency += extra.latency_ms
+                skipped = skipped or getattr(extra, "windows_skipped", False)
+                if extra.score > score:
+                    score = extra.score
+                scored_views.append(lbl)
     except ClassifierUnavailable as exc:
-        logger.warning("Layer 2 failed (%s); continuing with Layer 1 only.", exc)
+        logger.warning("Layer 2 failed (%s).", exc)
         layer_details["layer_2"] = {"status": "error", "reason": str(exc)}
         return None
     except Exception:
-        logger.exception("Unexpected Layer 2 error; continuing with Layer 1 only.")
+        logger.exception("Unexpected Layer 2 error.")
         layer_details["layer_2"] = {"status": "error", "reason": "unexpected_error"}
         return None
 
     layer_details["layer_2"] = {
         "status": "ok",
-        "score": round(res.score, 4),
-        "time_ms": round(res.latency_ms, 4),
+        "score": round(score, 4),
+        "time_ms": round(latency, 4),
         "context_turns": turns_used,
+        "windows": windows,
+        "windows_skipped": skipped,
+        "decoded_views_scored": scored_views,
     }
-    return res.score
+    return score
+
+
+def _protection_level(cfg: PipelineConfig, layer2_ran: bool) -> str:
+    """How much of the detection stack is actually protecting this request."""
+    l2 = cfg.layer_2_enabled and layer2_ran
+    if cfg.layer_1_enabled and l2 and cfg.layer_3_enabled:
+        return "full"
+    if cfg.layer_1_enabled and not l2 and not cfg.layer_3_enabled:
+        return "layer_1_only"
+    if not cfg.layer_1_enabled and not l2 and not cfg.layer_3_enabled:
+        return "none"
+    return "degraded"
+
+
+async def _handle_no_layer2_score(
+    prompt, system_instruction, context, cfg, request_id, start, layer_details,
+) -> "PipelineResult":
+    """Layer 2 produced no score: it is switched off, or it is on but unavailable.
+
+    Policy:
+      * Layer 2 switched OFF by the administrator -> everything that passed
+        Layer 1 goes to Layer 3 (when Layer 3 is on).
+      * Layer 2 ON but unavailable (model missing / crashed) -> layer_2.on_unavailable
+        in firewall.yaml: escalate (default) | block | pass.
+      * Layer 3 off too -> only Layer 1 protects the request; the result says so
+        ("protection": "layer_1_only") and the dashboard shows a warning.
+    """
+    disabled = not cfg.layer_2_enabled
+    policy = "escalate" if disabled else cfg.layer_2_on_unavailable
+    layer_details["protection"] = {
+        "level": _protection_level(cfg, layer2_ran=False),
+        "layer_2": "disabled" if disabled else "unavailable",
+        "policy": policy,
+    }
+    if disabled and "layer_2" not in layer_details:
+        layer_details["layer_2"] = {"status": "disabled"}
+
+    if policy == "block":
+        return PipelineResult(
+            request_id=request_id, is_blocked=True, action_taken="BLOCKED",
+            triggered_layer="LAYER_2", risk_score=1.0, execution_time_ms=_ms_since(start),
+            layer_details=layer_details, decision="BLOCK",
+        )
+    if policy == "pass":
+        return PipelineResult(
+            request_id=request_id, is_blocked=False, action_taken="PASSED",
+            triggered_layer="NONE", risk_score=0.0, execution_time_ms=_ms_since(start),
+            layer_details=layer_details, decision="PASS",
+        )
+    return await _escalate_to_layer3(
+        prompt, system_instruction, context, cfg, None, request_id, start, layer_details,
+    )
 
 
 _RATIONALE_MAX_CHARS = 300
@@ -403,7 +491,7 @@ async def _escalate_to_layer3(
     system_instruction: str,
     context,
     cfg: PipelineConfig,
-    score: float,
+    score: float | None,
     request_id: str,
     start: float,
     layer_details: dict,
@@ -480,15 +568,21 @@ async def run_pipeline(
     start = time.perf_counter()
     layer_details: dict = {}
 
+    # ---------------- Pre-processing (normalise + decode hidden text) ----------------
+    pre = preprocess(prompt)
+    if pre.flags or any(lbl.startswith("decoded_") for lbl, _ in pre.variants):
+        layer_details["preprocess"] = pre.summary()
+
     # ---------------- Layer 1 ----------------
     if cfg.layer_1_enabled:
         l1_start = time.perf_counter()
-        l1 = layer1_engine.evaluate(prompt)  # system prompt is trusted; scan user prompt only
+        l1 = layer1_engine.evaluate(prompt, pre=pre)  # system prompt is trusted; scan user prompt only
         layer_details["layer_1"] = {
             "matched": l1.matched,
             "rule_id": l1.rule_id,
             "category": l1.category,
             "severity": l1.severity,
+            "via": getattr(l1, "via", None),
             "time_ms": round(_ms_since(l1_start), 4),
         }
         if l1.matched:                      
@@ -502,16 +596,28 @@ async def run_pipeline(
     # ---------------- Layer 2 ----------------
     score = None
     if cfg.layer_2_enabled:
-        score = await _run_layer2(prompt, context, cfg, layer_details)
+        score = await _run_layer2(prompt, context, cfg, layer_details, pre)
 
-    if score is None:                       
-        return PipelineResult(
-            request_id=request_id, is_blocked=False, action_taken="PASSED",
-            triggered_layer="NONE", risk_score=0.0, execution_time_ms=_ms_since(start),
-            layer_details=layer_details, decision="PASS",
+    if score is None:
+        # Layer 2 is off or could not run: never a silent pass-through.
+        return await _handle_no_layer2_score(
+            prompt, system_instruction, context, cfg, request_id, start, layer_details,
         )
 
     decision = _decide(score, cfg)
+    # A prompt that looks deliberately obfuscated (encoded blobs, invisible
+    # characters, spaced-out letters) or that Layer 2 could not read in full
+    # must not be waved through on a low score: let Layer 3 look at it.
+    if decision == "PASS":
+        reason = None
+        if pre.suspicious:
+            reason = "obfuscation:" + ",".join(f for f in pre.flags if f in (
+                "invisible_characters", "large_encoded_blob", "opaque_blob", "spaced_letters"))
+        elif layer_details["layer_2"].get("windows_skipped"):
+            reason = "prompt_not_fully_scanned"
+        if reason:
+            decision = "ESCALATE"
+            layer_details["layer_2"]["escalated_because"] = reason
     layer_details["layer_2"]["decision"] = decision
 
     if decision == "BLOCK":

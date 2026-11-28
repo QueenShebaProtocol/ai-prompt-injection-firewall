@@ -20,6 +20,12 @@ layer_2:
   #   in between                         -> escalate to Layer 3
   high_confidence_threshold: 0.85
   low_confidence_threshold: 0.35
+  # What to do when Layer 2 is switched ON but cannot run (model missing/crashed):
+  #   escalate -> ask Layer 3 (default, recommended)
+  #   block    -> fail closed
+  #   pass     -> let it through (legacy; only Layer 1 protects)
+  # If Layer 2 is switched OFF, everything that passes Layer 1 goes to Layer 3.
+  on_unavailable: escalate
 
 hot_reload:
   rules_poll_seconds: 5 # how often the rule cache is refreshed so that edits appliy without a restart
